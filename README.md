@@ -2,94 +2,110 @@
 
 PortBridge is a Linux CLI tool that exposes a TCP service running on your
 machine to the public internet, so that **ordinary remote machines can
-connect to it without installing any VPN client**.
+connect to it with a plain TCP client — no VPN, no special software, no
+TLS wrapper needed on their end.**
 
-Only your Linux machine joins a tunneling network (Tailscale). The remote
-side never installs Tailscale or any VPN client — but it does need a
-TLS-capable connection, since that's a hard requirement of Tailscale
-Funnel itself (see below), not a PortBridge choice. In practice that means
-a browser, `openssl s_client`, `ncat --ssl`, or a plain client wrapped
-through one of those — see
-[Connecting non-TLS clients](#connecting-non-tls-clients-ssh-games-custom-protocols)
-below for exactly how.
-
-PortBridge forwards raw TCP bytes only. It does not interpret, modify, or
-execute anything sent over the connection, and it does not run a remote
-shell, RAT, or persistence mechanism of any kind.
+It works by running [frp](https://github.com/fatedier/frp)'s client
+(`frpc`) as a managed subprocess, connecting *out* to a small relay server
+(`frps`) that you deploy yourself, on any host that gives you one public
+TCP port — a $5-20/mo VPS, or a platform like Railway's TCP Proxy (the
+reference deployment below uses Railway, but nothing about PortBridge is
+Railway-specific).
 
 ```
-LOCAL TCP SERVICE  (e.g. `nc -l -p 9001`, a game server, an SSH daemon...)
+LOCAL TCP SERVICE   (e.g. `nc -l -p 9000`, a game server, anything)
         |
         v
-   PORTBRIDGE            <- runs only on your Linux machine
+   PORTBRIDGE          <- runs only on your Linux machine; supervises frpc
         |
         v
- TAILSCALE FUNNEL         <- your machine's tunnel into Tailscale's network
-                              (terminates the TLS it always requires here)
+      frpc              <- connects OUT to your relay, no inbound ports needed here
         |
         v
- PUBLIC TCP ENDPOINT       <yourmachine>.ts.net:{443,8443,10000}
+  YOUR RELAY (frps)      <- a small server you deploy, with one public TCP port
         |
         v
- REMOTE TCP CLIENT   (no VPN/Tailscale install -- but must speak TLS to connect)
+ REMOTE TCP CLIENT   (plain `nc host port` -- no VPN, no TLS, no special software)
 ```
 
-## Why Tailscale Funnel
+## Why this design (and why not Tailscale Funnel)
 
-PortBridge is built on [Tailscale Funnel](https://tailscale.com/kb/1223/funnel)
-because, as of this writing (verified against Tailscale's live documentation),
-it's the only option that clears every one of these bars at once:
+PortBridge was originally built on Tailscale Funnel. In practice that
+turned out to fail the actual requirement: Tailscale Funnel mandates TLS
+at its edge for every connection, even in its "raw TCP" mode — a genuinely
+plain client (`nc`, most game clients, stock `ssh`) cannot connect through
+it without being wrapped in `openssl s_client`/`ncat --ssl` first. If your
+use case tolerates that, Tailscale Funnel is still a fine option and needs
+no relay deployment of your own — see the CLI's `--help` history/git log
+for that version. PortBridge now defaults to a self-hosted relay because
+it's the only approach that gives a truly ordinary client (bare `nc`, a
+game client, anything) direct access with no client-side TLS or software
+requirement at all — the tradeoff is you deploy and pay for (or use spare
+capacity on) your own small relay instance.
 
-| Requirement | Tailscale Funnel |
-|---|---|
-| Remote client needs zero special software | Yes — plain TCP |
-| Free indefinitely (not a trial) | Yes — included on the free Personal plan |
-| No VPS required | Yes |
-| Stable, documented CLI | Yes |
+## Deploying your own relay
 
-Alternatives were researched and rejected for concrete reasons — see
-[Limitations](#limitations) and [Alternatives considered](#alternatives-considered)
-below. None of them beat this combination without also failing one of the
-above requirements.
+This is a one-time setup, done once per relay (not per PortBridge install).
+The reference deployment is two tiny services:
 
-## Supported external ports
+**1. `frps` — the relay server itself.**
 
-**This is the single most important limitation to understand before using
-PortBridge.** Tailscale Funnel does not support arbitrary external ports.
-Per Tailscale's own documentation:
-
-> Funnel can only listen on ports 443, 8443, and 10000.
-
-PortBridge enforces this honestly: if you ask to forward local port 9001 to
-external port 9001, and 9001 isn't one of the three allowed ports,
-PortBridge will **not** silently pick a different port for you. It explains
-the restriction and asks whether you want to use one of the allowed ports
-instead:
-
-```
-  Local port: 9001
-  Requested external port: 9001
-
-  ERROR:
-  The selected public forwarding mechanism does not support
-  external TCP port 9001.
-
-  Allowed external ports:
-    443
-    8443
-    10000
-
-  Would you like to use external port 10000?
-  [y/N]
+`Dockerfile`:
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates wget
+ARG FRP_VERSION=0.71.0
+RUN wget -q https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz \
+    && tar -xzf frp_${FRP_VERSION}_linux_amd64.tar.gz \
+    && mv frp_${FRP_VERSION}_linux_amd64/frps /usr/local/bin/frps \
+    && rm -rf frp_${FRP_VERSION}_linux_amd64*
+COPY frps.toml /etc/frp/frps.toml
+EXPOSE 7000 6000
+CMD ["/usr/local/bin/frps", "-c", "/etc/frp/frps.toml"]
 ```
 
-Your **local** port is not restricted — Funnel maps one of the three public
-ports to whatever local port your service actually listens on. Only the
-externally-visible port number is fixed to that list.
+`frps.toml` (generate a real random token — `openssl rand -hex 24` —
+don't use a placeholder):
+```toml
+bindPort = 7000
+
+auth.method = "token"
+auth.token = "REPLACE_WITH_A_LONG_RANDOM_SECRET"
+
+allowPorts = [
+  { start = 6000, end = 6000 }
+]
+```
+
+Deploy this container anywhere with **one exposed public TCP port**
+mapped to container port `7000` — that's the control port `frpc` connects
+to. Most platforms (Railway, Render, Fly.io, a plain VPS with Docker) can
+do this directly.
+
+**2. A tiny bridge for the second port, if your platform only allows one
+exposed port per service** (Railway's TCP Proxy does — check yours).
+`frp` needs a *second* public port for actual client traffic (`6000` in
+the config above), separate from the control port. If your platform
+allows exposing two ports on one service, skip this and expose `6000`
+directly instead. Otherwise, deploy a second minimal service on the same
+private network as `frps`:
+
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache socat
+CMD ["sh", "-c", "socat TCP-LISTEN:6000,fork,reuseaddr TCP:<frps-service-private-hostname>:6000"]
+```
+
+Expose *this* service's port `6000` publicly instead. On Railway, that
+private hostname is `<service-name>.railway.internal` — zero-config
+internal DNS between services in the same project.
+
+You now have two public addresses: the **control endpoint**
+(`frps-host:7000`, only `frpc` ever talks to this) and the **public data
+endpoint** (`bridge-host:6000`, what remote clients actually connect to).
+Feed both into `portbridge setup`.
 
 ## Installation
-
-See [INSTALL.md](INSTALL.md) for exact commands. Quick version:
 
 ```bash
 git clone https://github.com/devman-011/portbridge.git
@@ -98,74 +114,33 @@ cd portbridge
 portbridge --version
 ```
 
-## First-time setup
+See [INSTALL.md](INSTALL.md) for exact commands and options.
 
-Run:
+## First-time setup
 
 ```bash
 portbridge setup
 ```
 
-This is a guided, ask-before-acting check that gets Tailscale itself ready.
-It walks through, in order:
-
-1. **Is `tailscale` installed?** If not, it offers to run the official
-   installer for you (`curl -fsSL https://tailscale.com/install.sh | sh`).
-2. **Is the `tailscaled` background service running?** If not, it offers to
-   start it (`sudo systemctl enable --now tailscaled`).
-3. **Is this device authenticated?** If not, it offers to run
-   `tailscale up` for you — you still complete the actual login in a
-   browser yourself (Google/Microsoft/GitHub/Apple/passkey); PortBridge
-   never sees or stores your credentials.
-4. **(Optional)** offers to set you as the Tailscale operator
-   (`sudo tailscale set --operator=$USER`) so the background auto-reconnect
-   monitor doesn't need an interactive sudo password later. Without this,
-   PortBridge still works fine for interactive `start`/`stop`, but an
-   *unattended* reconnect after a tunnel drop will fail with a permission
-   error until you either do this or run PortBridge as root (e.g. the
-   systemd unit).
-5. Finally, it prints the one thing it **can't** check or fix for you: the
-   `funnel` ACL attribute in your tailnet's policy file (lives in your
-   Tailscale account, not on this device). New tailnets grant it by
-   default:
-
-   ```json
-   "nodeAttrs": [
-     { "target": ["autogroup:member"], "attr": ["funnel"] }
-   ],
-   ```
-
-   at https://login.tailscale.com/admin/acls. `portbridge start` will tell
-   you clearly if this is missing.
-
-Every step asks first — nothing installs or changes system state without
-your confirmation (or `portbridge setup --yes` if you want it to proceed
-non-interactively). `portbridge start` runs these same checks automatically
-and offers the same fixes inline, so running `setup` separately is a
-convenience, not a requirement.
+Checks whether `frpc` is installed (offers to download it for this
+machine's CPU architecture if not), then walks you through entering your
+relay's control address/port, data port, public address/port, and its
+auth token — the token is written to `~/.config/portbridge/relay_token`
+(mode 600), **never** into `config.toml`, which stays safe to read or
+share. Finishes by confirming the relay is actually reachable.
 
 ## Starting forwarding
 
 ```bash
-portbridge start --port 9001
+portbridge start --port 9000
 ```
 
-or interactively:
-
-```bash
-portbridge
-# choose 1) Start port forwarding, then enter the local port
-```
-
-PortBridge will, in order: validate the port, check whether your local
-service is actually listening, check Tailscale is installed/authenticated/
-connected, resolve the external port (prompting if your requested port
-isn't in the allowed list), apply the Funnel configuration, and start a
-background health-check/auto-reconnect monitor.
-
-Running `portbridge start` again while forwarding is already active does
-**not** create a duplicate tunnel — it shows the current mapping and offers
-to stop/reconfigure it.
+Validates the port, warns (but lets you proceed) if nothing's listening
+there yet, checks `frpc`/relay readiness, then starts a background monitor
+that runs `frpc` and supervises it — restarting it with exponential
+backoff if the process dies, and never spawning duplicates if you run
+`start` again while already active (it'll offer to stop/reconfigure
+instead).
 
 ## Stopping forwarding
 
@@ -173,10 +148,10 @@ to stop/reconfigure it.
 portbridge stop
 ```
 
-This stops only the forwarding PortBridge itself started (verified by PID
-and process identity, never an unrelated process) and removes the specific
-Funnel mapping it created. It never touches whatever is listening on your
-local port.
+Terminates PortBridge's own monitor process (verified by PID and process
+identity, never an unrelated process), which cleanly stops its `frpc`
+child as part of shutdown — that's what actually tears down the tunnel.
+Your local service is never touched.
 
 ## Checking status
 
@@ -184,138 +159,63 @@ local port.
 portbridge status
 ```
 
-Prints Tailscale install/auth/connection state, whether your local service
-is listening, current forwarding status (including reconnect attempt/
-backoff countdown if reconnecting), the public endpoint, uptime, and a
-health checklist that explains exactly what's wrong when something is.
-
-`portbridge endpoint` prints just `host:port`. `portbridge test` (or
-`--local`/`--external`) does a live TCP connectivity check against either
-side.
+Shows whether `frpc` is installed, the relay is configured/reachable,
+your local service is listening, current forwarding status (including
+reconnect attempt/backoff countdown), the public endpoint, uptime, and a
+health checklist. `portbridge endpoint` prints just `host:port`.
+`portbridge test` (or `--local`/`--external`) does a live TCP check.
 
 ## How the forwarding actually works
 
-- `portbridge start` runs `tailscale funnel --bg --tls-terminated-tcp=
-  <external-port> tcp://<bind>:<local-port>` by default. Tailscale states
-  plainly that *"Funnel only works over TLS-encrypted connections"* — this
-  applies even to the `--tcp` ("raw") mode; it isn't scoped to HTTPS only.
-  The difference between the two modes is only *who* terminates that
-  mandatory TLS layer:
-  - **`tls-terminated-tcp` (the default)** — Tailscale terminates TLS at
-    its edge and hands your local service plain, unencrypted bytes. Your
-    local service (a plain `nc`, `portbridge listen`, a game server, ...)
-    needs no changes. Only the *remote* connecting client needs a
-    TLS-capable tool, e.g. `openssl s_client -connect host:port` or
-    `ncat --ssl host port` — a bare `nc host port` will connect at the TCP
-    level and then get nothing through, since it never completes the
-    required TLS handshake.
-  - **`tcp` ("raw")** — Tailscale still requires TLS at its edge, but
-    passes the still-encrypted bytes through *without* decrypting them, so
-    your local service itself must terminate TLS. Only use this if your
-    local service already speaks TLS directly (its own cert, etc).
-    Confirmed by another user hitting exactly this with a plain
-    (non-TLS) Minecraft client:
-    [tailscale/tailscale#14240](https://github.com/tailscale/tailscale/issues/14240).
-- Tailscale's own infrastructure (not PortBridge) handles NAT traversal,
-  routing, and the public `*.ts.net` hostname/certificate. No inbound
-  firewall or router port-forwarding changes are needed on your machine —
-  Funnel traffic arrives via the outbound Tailscale connection your machine
-  already maintains, not via a raw listening socket on your public
-  interface. PortBridge never modifies firewall rules.
-- PortBridge's own background monitor does **not** forward bytes itself; it
-  only applies/removes the Funnel mapping and watches its health. The
-  actual byte forwarding is done entirely by `tailscaled`.
-
-## Connecting non-TLS clients (SSH, games, custom protocols)
-
-Because Tailscale requires a real TLS handshake as the very first thing on
-the wire, a client that doesn't speak TLS at all — a stock `ssh` client,
-most game clients, most bespoke TCP protocols — can't connect to the
-public endpoint directly, even with `tls-terminated-tcp` mode doing you
-the favor of decrypting for your local service. You need to wrap the
-connection in TLS yourself on the client side. Two common patterns:
-
-**SSH**, using `openssl` as the TLS layer via `ProxyCommand` (the remote
-user runs this, no Tailscale/VPN install involved, just a locally-run
-`openssl`):
-
-```bash
-ssh -o ProxyCommand="openssl s_client -quiet -connect %h:%p" user@yourmachine.your-tailnet.ts.net -p 10000
-```
-
-**Anything else (games, custom protocols)** that only knows how to speak
-to a plain `host:port` — run a local TLS-terminating proxy on the
-*client's* machine and point the actual client at that local proxy
-instead of the public endpoint directly. `socat` is a common choice:
-
-```bash
-# On the remote/client machine:
-socat TCP-LISTEN:9001,fork OPENSSL:yourmachine.your-tailnet.ts.net:10000,verify=0
-# Then point the actual client (game, etc.) at 127.0.0.1:9001
-```
-
-(`verify=0` skips certificate hostname validation against Tailscale's
-`*.ts.net` cert chain for convenience; drop it and configure proper CA
-trust if that matters for your use case.)
+- `portbridge start` generates an `frpc` config from `config.toml` + your
+  saved token, then runs `frpc -c <generated config>` as a subprocess it
+  directly supervises (unlike a design where the tunnel daemon runs
+  independently, `frpc` *is* the tunnel — if the process dies, the
+  tunnel is gone, so PortBridge's monitor restarts it on failure).
+- `frpc` connects **outbound** to your relay's control port — no inbound
+  firewall/router changes are ever needed on your machine for this to
+  work, since your machine never accepts a connection from the internet
+  directly.
+- Your relay (`frps`) is the only thing with a public IP in this picture.
+  It's real infrastructure you deploy and are responsible for — this is
+  the tradeoff for arbitrary ports and zero client-side requirements.
+- `frpc` has its own internal reconnect logic for transient network drops;
+  PortBridge's health loop mainly reacts to the `frpc` *process* itself
+  exiting, not brief blips.
 
 ## Security considerations
 
-- PortBridge never stores a Tailscale auth token. Authentication is
-  delegated entirely to `tailscale up`/`tailscale login`, which keep their
-  own credentials inside `tailscaled`'s state directory.
-- PortBridge only ever manages the exact port mapping you asked for. It
-  never scans the network, never opens additional ports, and never expands
-  scope beyond your request.
-- PortBridge never modifies local firewall rules. If a firewall change were
-  ever genuinely required for some setup, it would be explained and
-  confirmed with you first — this version never needs to make one.
-- The forwarded connection is treated as opaque bytes end to end. PortBridge
-  does not parse, log payload content, or execute anything received over it.
-- Prefer `bind_address = 127.0.0.1` (the default) so only Funnel — not your
-  LAN — can reach the local service through PortBridge.
+- The relay auth token is the one real secret PortBridge holds. It's kept
+  in `~/.config/portbridge/relay_token` (mode 600), separate from
+  `config.toml`, and is only ever read to generate `frpc`'s config file
+  (also mode 600) at start time.
+- PortBridge only ever forwards the exact local port you asked for. It
+  never scans the network, never opens additional ports, and never
+  expands scope beyond your request.
+- PortBridge never modifies local firewall rules — none are needed, since
+  `frpc` only makes outbound connections.
+- The forwarded connection is treated as opaque bytes end to end.
+  PortBridge does not parse, log payload content, or execute anything
+  received over it.
+- Prefer `bind_address = 127.0.0.1` (the default) so only `frpc` — not
+  your LAN — can reach the local service through PortBridge.
+- Your relay is your responsibility to secure: keep its auth token
+  private (anyone with it can register tunnels through your relay), and
+  treat the relay host like any other small internet-facing service.
 
 ## Limitations
 
-- External TCP port is restricted to 443, 8443, or 10000 (see above) — this
-  is a Tailscale Funnel restriction, not a PortBridge one.
-- **Every connecting client must speak TLS to reach the public endpoint at
-  all** — Tailscale enforces this at its edge regardless of mode. A
-  genuinely plain TCP client (bare `nc`, stock `ssh`, most game/custom
-  protocol clients) cannot connect directly; see
-  [Connecting non-TLS clients](#connecting-non-tls-clients-ssh-games-custom-protocols).
-- The public hostname is always `<device>.<tailnet>.ts.net`; Funnel cannot
-  use a custom domain.
-- Funnel traffic is subject to Tailscale's non-configurable bandwidth
-  limits (Tailscale does not publish a specific numeric cap).
-- Exact CLI exit codes and error text for `tailscale` failures are not
-  officially documented by Tailscale; PortBridge classifies errors from
-  `stderr` text on a best-effort basis and always shows you the raw message
-  alongside its interpretation.
-- One local service can be forwarded at a time per PortBridge instance/
-  state file (Funnel and Serve also cannot share a port number on one
-  device, per Tailscale's own documentation).
-
-### Alternatives considered
-
-Researched and rejected when this tool was built (see also `portbridge
---help` and the code comments in `src/portbridge/tailscale.py` for sourcing):
-
-- **Cloudflare Tunnel** — free, but its TCP service type requires the
-  *remote* client to also run `cloudflared access tcp` (or WARP). Fails the
-  "ordinary client, no special software" requirement.
-- **Cloudflare Spectrum** — the right mechanism (ordinary clients, arbitrary
-  TCP), but arbitrary/custom TCP is Enterprise-only (paid, contact-sales).
-- **ngrok** — free-tier TCP endpoints exist but require a credit card on
-  file, cap out at 3 concurrent endpoints / ~5,000 connections per month,
-  and hand out a random address that changes on every restart.
-- **bore / bore.pub** — genuinely free, zero client software, but a small
-  single-maintainer hobby project with no SLA; the public relay has no
-  authentication, so a requested fixed port isn't reserved and can be taken
-  by someone else. A reliable deployment needs self-hosting the relay on
-  your own VPS, which reintroduces the infrastructure this tool avoids.
-- **playit.gg** — promising, but whether arbitrary/custom TCP is available
-  on the free tier (versus a paid Premium tier) could not be confirmed from
-  an official source at research time.
+- You must deploy and maintain your own relay — this is not a zero-setup,
+  zero-cost solution the way a hosted tunnel service would be. See
+  "Deploying your own relay" above.
+- One local service can be forwarded at a time per PortBridge instance
+  (one `frps` public data port per relay deployment, in the reference
+  setup above).
+- The public port is whatever you configured when deploying your relay —
+  PortBridge doesn't renegotiate it per `start`.
+- Exact `frpc` exit codes/log formats aren't a stable, versioned API;
+  PortBridge treats "process alive" as the primary health signal rather
+  than parsing log text, which is intentionally conservative.
 
 ## Testing
 
@@ -335,8 +235,9 @@ failure modes.
 | Path | Purpose |
 |---|---|
 | `~/.config/portbridge/config.toml` | Configuration (no secrets) |
+| `~/.config/portbridge/relay_token` | Relay auth token (mode 600) |
 | `~/.local/state/portbridge/state.json` | Runtime state |
-| `~/.local/state/portbridge/portbridge.log` | Logs |
+| `~/.local/state/portbridge/portbridge.log` | Logs (includes `frpc`'s own log output) |
 
 ## Contributing
 

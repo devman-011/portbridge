@@ -6,8 +6,12 @@
   distro and architecture and tells you exactly what to run if something's
   missing).
 - `python3` with the `venv` module.
-- The `tailscale` CLI (the installer offers to install it for you via
-  Tailscale's official script if it's missing).
+- The `frpc` binary (`portbridge setup` offers to download it for you,
+  matched to this machine's CPU architecture).
+- A relay of your own already deployed somewhere reachable — see README's
+  [Deploying your own relay](README.md#deploying-your-own-relay).
+  PortBridge doesn't set this part up for you; it's a one-time step
+  outside PortBridge itself.
 
 ## Standard install (per-user, no root required)
 
@@ -44,7 +48,7 @@ Installs to `/opt/portbridge/venv`, symlinked as `/usr/local/bin/portbridge`.
 ./install.sh [options]
 
   --system         Install machine-wide under /opt and /usr/local (needs root)
-  -y, --yes        Assume yes for optional-but-safe prompts (deps, Tailscale)
+  -y, --yes        Assume yes for optional-but-safe prompts (dependencies)
   --with-systemd   Also install the systemd unit (still not enabled/started)
   --no-systemd     Never prompt about the systemd unit
   -h, --help       Show help
@@ -55,18 +59,22 @@ installs files, and tells you the exact commands to run next.
 
 ## First-time setup
 
+You need a relay deployed first — see README's
+[Deploying your own relay](README.md#deploying-your-own-relay) if you
+haven't done that yet. Once you have its control address/port, data port,
+public address/port, and auth token:
+
 ```bash
 portbridge setup
 ```
 
-This checks whether Tailscale is installed, running, and authenticated,
-offering to fix each gap for you (installing it, starting the
-`tailscaled` service, running `tailscale up`) with a confirmation prompt
-before each action -- see README's [First-time setup](README.md#first-time-setup)
-for exactly what it does and why the login step still needs you personally.
+Checks whether `frpc` is installed (offers to download it for this
+machine's architecture if not), walks you through entering the relay
+details above, and confirms it's actually reachable.
 
 ```bash
-portbridge configure   # optional: set defaults (local/external port, etc.)
+portbridge configure --relay-token <token>   # if you didn't enter it during setup
+portbridge configure                         # optional: interactive wizard for other defaults
 ```
 
 ## Exact first-run commands
@@ -90,7 +98,7 @@ Only if you passed `--with-systemd` (or answered yes to the prompt) during
 install:
 
 ```bash
-portbridge configure --local-port 9001 --external-port 10000
+portbridge configure --local-port 9001
 sudo systemctl daemon-reload
 sudo systemctl enable --now portbridge
 ```

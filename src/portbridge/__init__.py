@@ -1,3 +1,3 @@
-"""PortBridge - TCP port forwarding manager built on Tailscale Funnel."""
+"""PortBridge - TCP port forwarding manager built on a self-hosted frp relay."""
 
-__version__ = "1.0.4"
+__version__ = "2.0.0"

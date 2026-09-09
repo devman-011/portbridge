@@ -4,10 +4,10 @@
 # (PortBridge creates this automatically on first run with built-in
 # defaults; this file is a documented reference, not required reading.)
 #
-# No secrets belong in this file. Tailscale authentication is handled
-# entirely by `tailscale up` / `tailscale login`, which store their own
-# credentials inside tailscaled's state directory -- PortBridge never
-# reads, stores, or logs an auth key.
+# No secrets belong in this file. The relay auth token lives separately
+# at ~/.config/portbridge/relay_token (mode 600) -- set it with
+# `portbridge configure --relay-token <token>`, never by hand-editing
+# this file.
 
 [network]
 # Local address PortBridge forwards FROM. Keep this at 127.0.0.1 unless you
@@ -19,29 +19,23 @@ bind_address = "127.0.0.1"
 # and answer the interactive prompt with Enter. 0 means "always ask".
 local_port = 0
 
-# Default external (public) port. Tailscale Funnel only supports 443,
-# 8443, or 10000 -- see https://tailscale.com/kb/1223/funnel
-external_port = 10000
+[relay]
+# Your relay's control address/port -- where `frpc` connects to register
+# the tunnel (frps's bindPort). See README's "Deploying your own relay".
+server_addr = ""
+server_port = 0
 
-[provider]
-name = "tailscale-funnel"
+# The port frps listens on internally for this tunnel's data (must match
+# allowPorts in your frps.toml and the bridge service in front of it, if
+# your platform only allows one exposed port per service).
+remote_port = 0
 
-# Tailscale requires TLS at its edge either way ("Funnel only works over
-# TLS-encrypted connections", per Tailscale's own docs) -- these two modes
-# only differ in who terminates it:
-#
-# "tls-terminated-tcp" (default) -- tailscale funnel --tls-terminated-tcp=<port> ...
-#                        Tailscale terminates TLS at the edge and hands
-#                        your local service plain bytes. Your local
-#                        service (a plain `nc`/`nc -l`, etc.) needs no
-#                        changes; the *remote* client needs a TLS-capable
-#                        tool (`openssl s_client`, `ncat --ssl`) -- a bare
-#                        `nc` will connect but get no data through.
-# "tcp"              -- tailscale funnel --tcp=<port> ...
-#                        Tailscale passes the still-TLS-encrypted bytes
-#                        through undecrypted; only useful if your LOCAL
-#                        service itself terminates TLS.
-mode = "tls-terminated-tcp"
+# What remote clients actually connect to -- may be the same host:port as
+# server_addr/server_port, or a separate bridge service's address if your
+# platform (like Railway's TCP Proxy) only allows one exposed port per
+# service.
+public_addr = ""
+public_port = 0
 
 [behavior]
 # Informational only -- PortBridge never enables/starts systemd on its own.
@@ -49,8 +43,9 @@ mode = "tls-terminated-tcp"
 # unit for auto-start on boot; it has no other effect.
 auto_start = false
 
-# Whether the background monitor retries automatically after a tunnel
-# health-check failure.
+# Whether the background monitor restarts frpc automatically if the
+# process exits unexpectedly. frpc has its own internal reconnect logic
+# for transient network drops -- this is for the process itself dying.
 reconnect = true
 
 # 0 = retry indefinitely. Any positive number = give up after that many
@@ -62,10 +57,11 @@ reconnect_max_attempts = 0
 reconnect_backoff_base_seconds = 2
 reconnect_backoff_max_seconds = 60
 
-# How often the background monitor checks tunnel + local-port health.
+# How often the background monitor checks frpc + local-port health.
 health_check_interval_seconds = 15
 
-# Timeout used for `portbridge test` and internal connectivity checks.
+# Timeout used for `portbridge test`, `portbridge setup`'s relay
+# reachability check, and internal connectivity checks.
 connect_timeout_seconds = 5
 
 [logging]

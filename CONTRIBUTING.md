@@ -9,12 +9,12 @@ bug reports, and forks are welcome.
 portbridge/
   src/portbridge/
     cli.py          Argument parsing, interactive menu, all do_*() commands
-    core.py          Shared probe/apply/remove logic (no printing, no prompts)
-    tailscale.py     Thin wrapper around the `tailscale` CLI (subprocess only)
-    monitor.py       Background health-check / auto-reconnect loop
+    core.py          Shared probe logic (no printing, no prompts)
+    relay.py         Thin wrapper around the `frpc` binary: install, config generation, spawn
+    monitor.py       Background health-check / auto-reconnect loop; supervises frpc as a child
     process.py       Spawning/terminating the detached monitor process
     state.py         state.json read/write, stale-PID detection
-    config.py        config.toml read/write, defaults, allowed-port constants
+    config.py        config.toml read/write, defaults, relay token file handling
     netcheck.py       Plain TCP connectivity checks
     ui.py            Terminal rendering (boxes, prompts, colors)
     validation.py    Port validation shared by CLI args and prompts
@@ -26,6 +26,11 @@ portbridge/
   man/portbridge.1
   README.md / INSTALL.md / TROUBLESHOOTING.md / TESTING.md
 ```
+
+Note the relay server (`frps`) itself is not part of this repo — it's a
+separate one-time deployment (Dockerfile + frps.toml in the README) that
+you run on whatever host gives you a public TCP port. PortBridge only
+ever manages the client side (`frpc`).
 
 `cli.py` is the only place that prints to the terminal or prompts for
 input — every other module either returns data or raises a
@@ -53,9 +58,9 @@ menu.
   reasonably hit (missing binary, bad port, network down, etc.) should be
   a `PortBridgeError` subclass in `errors.py` with a plain-English
   `message` and a `hint` (a diagnostic command), not a bare exception.
-- **Honesty about provider limits.** Don't work around or hide Tailscale
-  Funnel's restrictions (fixed external ports, etc.) — surface them
-  clearly instead.
+- **Honesty about relay/frp limits.** Don't paper over `frpc` failures or
+  relay misconfiguration with vague messages — surface the real cause
+  (bad token, unreachable relay, port mismatch) clearly instead.
 
 ## Setting up a dev environment
 
@@ -77,7 +82,7 @@ portbridge --version
 2. Run through the relevant scenarios in [TESTING.md](TESTING.md) — there's
    no automated test suite yet (a good first contribution if you want one:
    pytest around `config.py`/`state.py`/`validation.py`/`core.py`, which
-   have no `tailscale` dependency and are easy to unit test in isolation).
+   have no `frpc` dependency and are easy to unit test in isolation).
 3. Keep `README.md`/`TROUBLESHOOTING.md`/the man page in sync with any
    user-facing CLI change (new flag, new command, changed default).
 4. Open a pull request describing what changed and why.
@@ -86,7 +91,7 @@ portbridge --version
 
 Include:
 - `portbridge --version`
-- `tailscale version`
+- `frpc --version`
 - Your distro (`cat /etc/os-release`)
 - The relevant excerpt from `~/.local/state/portbridge/portbridge.log`
   (PortBridge logs full tracebacks there even when the terminal only shows

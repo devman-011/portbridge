@@ -1,6 +1,6 @@
-.TH PORTBRIDGE 1 "2026" "portbridge 1.0.0" "PortBridge Manual"
+.TH PORTBRIDGE 1 "2026" "portbridge 2.0.0" "PortBridge Manual"
 .SH NAME
-portbridge \- manage TCP port forwarding to the public internet via Tailscale Funnel
+portbridge \- manage TCP port forwarding to the public internet through your own relay
 .SH SYNOPSIS
 .B portbridge
 .RI [ command ]
@@ -9,36 +9,33 @@ portbridge \- manage TCP port forwarding to the public internet via Tailscale Fu
 .B portbridge
 exposes a TCP service listening on this Linux machine to ordinary internet
 TCP clients, without requiring the remote machine to install any VPN
-client or special software. It does this by driving the official
-.B tailscale
-CLI's Funnel feature: this machine joins your private Tailscale network
-(tailnet) and Tailscale's infrastructure publishes one of your local ports
-to a fixed, small set of public TCP ports on your tailnet's
-.I *.ts.net
-hostname. Only this machine ever needs Tailscale installed; a remote user
-connects with a plain TCP client such as
+client, special software, or TLS wrapper. It does this by running
+.BR frpc (1)
+(the client half of
+.IR frp ,
+Fast Reverse Proxy) as a managed subprocess: frpc connects
+.I outbound
+to a relay server (frps) you deploy yourself on any host with one public
+TCP port. Only this machine needs frpc installed; a remote user connects
+with a plain TCP client such as
 .BR nc (1).
 .PP
 portbridge never inspects, modifies, or executes anything received over
 the forwarded connection \(em it forwards raw TCP bytes only.
 .PP
-Because Tailscale Funnel is restricted by the provider to external TCP
-ports 443, 8443, and 10000, portbridge will refuse to silently substitute
-a different port when you request one that isn't supported; instead it
-explains the restriction and asks you to choose an allowed port.
+Deploying the relay itself is a one\-time step outside portbridge \(em see
+the README for a worked Dockerfile/frps.toml example. portbridge manages
+the client side only: installing frpc, generating its config, running and
+supervising it.
 .PP
 With no command, portbridge launches an interactive menu.
 .SH COMMANDS
 .TP
 .B setup
-Check whether Tailscale is installed, its background service is running,
-and this device is authenticated -- offering to fix each gap
-interactively (installing Tailscale, starting
-.BR tailscaled ,
-running
-.BR "tailscale up" )
-with a confirmation prompt before each action. Never proceeds on its own
-in a non-interactive context unless
+Check whether frpc is installed and the relay is configured/reachable \(em
+offering to download frpc for this machine's CPU architecture, and
+walking through entering the relay's address/ports/token if missing.
+Never proceeds on its own in a non\-interactive context unless
 .B \-\-yes
 is given.
 .RS
@@ -55,19 +52,8 @@ the command line.
 .BR \-\-port =\fIPORT\fR
 Local port to forward.
 .TP
-.BR \-\-external\-port =\fIPORT\fR
-Requested public port (must be 443, 8443, or 10000).
-.TP
 .BR \-\-bind =\fIADDRESS\fR
 Local bind address (default 127.0.0.1).
-.TP
-.BR \-\-mode =\fIMODE\fR
-.I tls\-terminated\-tcp
-(default; Tailscale terminates the TLS it always requires at its edge and
-hands your local service plain bytes) or
-.I tcp
-(raw forwarder; Tailscale still requires TLS at the edge but does not
-decrypt it, so your local service must terminate TLS itself).
 .TP
 .B \-\-foreground
 Run in the foreground instead of detaching a background monitor. Intended
@@ -80,14 +66,15 @@ Assume yes on all confirmation prompts (for scripting).
 .RE
 .TP
 .B stop
-Stop TCP port forwarding started by portbridge. Never affects the local
-service listening on the forwarded port, and never affects processes
-portbridge did not start.
+Stop TCP port forwarding started by portbridge. Terminates the monitor
+process, which cleanly stops its frpc child as part of shutdown. Never
+affects the local service listening on the forwarded port, and never
+affects processes portbridge did not start.
 .TP
 .B status
-Print a detailed status report: Tailscale install/auth/connection state,
-whether the local port is listening, current forwarding status, the
-public endpoint, uptime, and a health checklist.
+Print a detailed status report: frpc install state, relay
+configured/reachable, whether the local port is listening, current
+forwarding status, the public endpoint, uptime, and a health checklist.
 .TP
 .B endpoint
 Print the current public endpoint as
@@ -109,7 +96,8 @@ Override which local port to test.
 .TP
 .B logs
 Show recent log entries from
-.IR ~/.local/state/portbridge/portbridge.log .
+.IR ~/.local/state/portbridge/portbridge.log ,
+including frpc's own log output.
 .RS
 .TP
 .BR \-f ", " \-\-follow
@@ -127,7 +115,9 @@ configuration.
 .B configure
 Interactive configuration wizard, or pass flags (see
 .BR "portbridge configure \-\-help" )
-to set specific values non\-interactively.
+to set specific values non\-interactively, including
+.B \-\-relay\-token
+to set the relay auth token (stored outside config.toml).
 .TP
 .B listen
 Run a disposable TCP echo listener for testing, completely separate from
@@ -141,12 +131,19 @@ Print the installed version and exit.
 .SH FILES
 .TP
 .I ~/.config/portbridge/config.toml
-User configuration (bind address, default ports, health\-check/backoff
-timings, logging level). Contains no secrets.
+User configuration (bind address, local port, relay address/ports,
+health\-check/backoff timings, logging level). Contains no secrets.
+.TP
+.I ~/.config/portbridge/relay_token
+The relay auth token, mode 600. The one real secret portbridge holds.
 .TP
 .I ~/.local/state/portbridge/state.json
 Current runtime state: whether forwarding is active, the monitor PID,
-configured ports, public hostname, start time, and health.
+the local port, the public address/port, start time, and health.
+.TP
+.I ~/.local/state/portbridge/frpc.generated.toml
+frpc's config, generated fresh each time forwarding starts. Mode 600
+(contains the auth token).
 .TP
 .I ~/.local/state/portbridge/portbridge.log
 Rotating log file.
@@ -158,17 +155,14 @@ on a handled error (message printed to stderr),
 .B 130
 if interrupted with Ctrl+C.
 .SH SECURITY
-portbridge never stores Tailscale authentication tokens; login is
-delegated entirely to
-.B tailscale up
-/
-.BR "tailscale login" .
-It never scans the network, never opens ports you did not request, never
-modifies local firewall rules, and never executes anything received over
-the forwarded TCP connection.
+portbridge keeps the relay auth token out of config.toml, in a mode\-600
+file, and only ever reads it to generate frpc's own (also mode\-600)
+config. It never scans the network, never opens ports you did not
+request, never modifies local firewall rules (frpc only makes outbound
+connections, so none are needed), and never executes anything received
+over the forwarded TCP connection.
 .SH SEE ALSO
-.BR tailscale (1),
 .BR nc (1),
 .BR systemctl (1)
 .br
-Tailscale Funnel documentation: https://tailscale.com/kb/1223/funnel
+frp project: https://github.com/fatedier/frp

@@ -33,6 +33,19 @@ def log_file() -> Path:
     return state_dir() / "portbridge.log"
 
 
+def relay_token_file() -> Path:
+    """The relay's auth token, kept out of config.toml on purpose (config
+    is meant to be readable/shareable; this file is chmod 600 and holds
+    the one real secret PortBridge needs)."""
+    return config_dir() / "relay_token"
+
+
+def frpc_config_file() -> Path:
+    """The frpc TOML config PortBridge generates from config.toml + the
+    relay token each time forwarding starts -- not hand-edited."""
+    return state_dir() / "frpc.generated.toml"
+
+
 def ensure_dirs() -> None:
     config_dir().mkdir(parents=True, exist_ok=True)
     state_dir().mkdir(parents=True, exist_ok=True)

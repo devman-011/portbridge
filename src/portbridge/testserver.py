@@ -1,6 +1,6 @@
 """Optional disposable TCP listener for testing -- deliberately isolated
 from forwarding management. This is a convenience stand-in for `nc -l -p
-PORT`; it never reads state.json, never touches Tailscale, and PortBridge's
+PORT`; it never reads state.json, never touches the relay, and PortBridge's
 forwarding logic never imports or calls into it. It echoes back whatever it
 receives, one connection at a time, and prints received data to stdout so
 you can watch bytes arrive when testing forwarding end-to-end.

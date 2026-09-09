@@ -16,9 +16,11 @@
 #   man page:   /usr/local/share/man/man1/portbridge.1
 #
 # Never overwrites unrelated files, never enables a systemd service on its
-# own, and never installs Tailscale or a systemd unit without asking first
-# (unless -y/--yes is combined with the relevant explicit flag, matching
-# normal Linux installer conventions).
+# own, and never installs a systemd unit without asking first (unless
+# -y/--yes is combined with the relevant explicit flag, matching normal
+# Linux installer conventions). The frpc relay client and relay
+# configuration are handled separately by `portbridge setup` after
+# install, not by this script.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +40,7 @@ Usage: ./install.sh [options]
 
 Options:
   --system         Install machine-wide under /opt and /usr/local (needs root)
-  -y, --yes        Assume yes for optional-but-safe prompts (deps, Tailscale)
+  -y, --yes        Assume yes for optional-but-safe prompts (dependencies)
   --with-systemd   Also install the systemd unit (still not enabled/started)
   --no-systemd     Never prompt about the systemd unit
   -h, --help       Show this help
@@ -80,7 +82,7 @@ if [ ! -f "$SCRIPT_DIR/pyproject.toml" ]; then
 fi
 
 if [ "$(uname -s)" != "Linux" ]; then
-  err "PortBridge is Linux-only (relies on /proc, systemd, and Tailscale Funnel). Detected: $(uname -s)"
+  err "PortBridge is Linux-only (relies on /proc and systemd). Detected: $(uname -s)"
   exit 1
 fi
 
@@ -133,18 +135,6 @@ if ! python3 -c 'import venv' >/dev/null 2>&1; then
       exit 1
       ;;
   esac
-fi
-
-# --- tailscale -----------------------------------------------------------
-if command -v tailscale >/dev/null 2>&1; then
-  info "tailscale found: $(tailscale version 2>/dev/null | head -n1)"
-else
-  warn "The 'tailscale' CLI was not found. PortBridge needs it to create the public endpoint."
-  if [ "$ASSUME_YES" = 1 ] || ask_yes_no "Install Tailscale now via the official install script (curl https://tailscale.com/install.sh | sh)?" y; then
-    curl -fsSL https://tailscale.com/install.sh | sh
-  else
-    warn "Skipping. Install it later with: curl -fsSL https://tailscale.com/install.sh | sh"
-  fi
 fi
 
 # --- install prefix -----------------------------------------------------
@@ -231,14 +221,17 @@ echo "Verify:"
 echo "  portbridge --version"
 echo
 echo "First-time setup:"
-echo "  sudo tailscale up                                # authenticate this machine"
-echo "  sudo tailscale set --operator=$INSTALL_USER          # optional: unattended reconnect without sudo"
-echo "  portbridge configure                             # set defaults (optional)"
+echo "  portbridge setup                                 # install frpc, configure your relay"
 echo "  portbridge start --port <your-local-port>"
+echo
+echo "(portbridge setup needs a relay already deployed -- see README for how"
+echo " to deploy one: a small frps server + bridge on any host with a public"
+echo " TCP port, e.g. Railway's TCP Proxy.)"
 echo
 if [ "$WANT_SYSTEMD" = 1 ]; then
   echo "Systemd unit was installed but not enabled. To use it:"
-  echo "  portbridge configure --local-port <PORT> --external-port <443|8443|10000>"
+  echo "  portbridge setup"
+  echo "  portbridge configure --local-port <PORT>"
   echo "  sudo systemctl daemon-reload"
   echo "  sudo systemctl enable --now portbridge"
   echo

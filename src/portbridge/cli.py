@@ -7,11 +7,10 @@ functions below, so behavior never diverges between the two entry points.
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from portbridge import __version__
 from portbridge import config as config_mod
@@ -21,18 +20,16 @@ from portbridge import monitor
 from portbridge import netcheck
 from portbridge import paths
 from portbridge import process
+from portbridge import relay as relay_mod
 from portbridge import state as state_mod
-from portbridge import tailscale as ts
 from portbridge import testserver
 from portbridge import ui
 from portbridge import validation
 from portbridge.errors import (
-    ExternalPortInUseError,
-    NetworkUnavailableError,
-    NotAuthenticatedError,
+    FrpcNotInstalledError,
     PortBridgeError,
-    TailscaleDaemonUnreachableError,
-    TailscaleNotInstalledError,
+    RelayConnectionError,
+    RelayNotConfiguredError,
 )
 
 
@@ -40,19 +37,16 @@ from portbridge.errors import (
 # setup / dependency checks
 # ---------------------------------------------------------------------------
 
-ADMIN_ACL_URL = "https://login.tailscale.com/admin/acls"
-
-
 def _confirm_system_change(prompt: str, assume_yes: bool) -> bool:
     """Gate for prompts that trigger a system-modifying action (installing
-    software, starting/enabling a privileged service). Unlike ui.ask_yes_no
-    (which falls back to its `default` when stdin isn't a TTY -- fine for
-    low-stakes prompts like "continue anyway?"), this NEVER proceeds on its
-    own just because stdin is non-interactive: it requires either the
-    explicit --yes flag or a real answer at a real terminal. That matters
-    here specifically because `ensure_tailscale_ready` can be reached from
-    a non-interactive `portbridge start` (e.g. from a script/cron), where
-    silently running `curl | sh` would be a serious overreach.
+    software). Unlike ui.ask_yes_no (which falls back to its `default`
+    when stdin isn't a TTY -- fine for low-stakes prompts like "continue
+    anyway?"), this NEVER proceeds on its own just because stdin is
+    non-interactive: it requires either the explicit --yes flag or a real
+    answer at a real terminal. That matters because `ensure_relay_ready`
+    can be reached from a non-interactive `portbridge start` (e.g. from a
+    script/cron), where silently downloading and installing a binary
+    would be a real overreach.
     """
     if assume_yes:
         return True
@@ -61,125 +55,127 @@ def _confirm_system_change(prompt: str, assume_yes: bool) -> bool:
     return ui.ask_yes_no(prompt, default=True)
 
 
-def _run_visible(argv: list[str]) -> int:
-    """Runs a command with output/prompts inherited from the terminal (so
-    the user sees installer progress and any sudo password prompt), and
-    turns a missing executable into a clean message instead of a
-    traceback."""
-    try:
-        return subprocess.run(argv).returncode
-    except FileNotFoundError as exc:
-        print(f"  Could not run '{argv[0]}': {exc}")
-        return 127
+def _missing_relay_fields(cfg: dict) -> list[str]:
+    relay = cfg["relay"]
+    missing = []
+    if not relay["server_addr"]:
+        missing.append("server_addr")
+    if not relay["server_port"]:
+        missing.append("server_port")
+    if not relay["remote_port"]:
+        missing.append("remote_port")
+    if not relay["public_addr"]:
+        missing.append("public_addr")
+    if not relay["public_port"]:
+        missing.append("public_port")
+    if not config_mod.load_relay_token():
+        missing.append("relay_token")
+    return missing
 
 
-def ensure_tailscale_ready(assume_yes: bool = False) -> core.Probe:
-    """Checks tailscale is installed, tailscaled is reachable, this device
-    is authenticated, and the network is up -- offering to fix each gap
-    interactively (never silently) before raising if it still can't
-    proceed. Shared by `portbridge start` and `portbridge setup`."""
-    probe = core.probe_tailscale()
+def ensure_relay_ready(cfg: dict, assume_yes: bool = False) -> core.Probe:
+    """Checks frpc is installed and the relay is configured/reachable --
+    offering to install frpc interactively (never silently) before
+    raising if it still can't proceed. Shared by `portbridge start` and
+    `portbridge setup`. Missing relay *configuration* (as opposed to the
+    frpc binary) is not filled in here -- that's what `portbridge setup`
+    walks you through; this just checks and points you there.
+    """
+    probe = core.probe_relay(cfg, check_reachable=False)
 
-    if not probe.tailscale_installed:
-        print("\nTailscale isn't installed yet. PortBridge needs it to create the public endpoint.")
+    if not probe.frpc_installed:
+        print("\nfrpc isn't installed yet. PortBridge needs it to run the tunnel client.")
         if _confirm_system_change(
-            "Install it now via the official installer "
-            "(curl -fsSL https://tailscale.com/install.sh | sh)?", assume_yes
+            "Install it now (downloads the frpc release for this machine's CPU architecture)?",
+            assume_yes,
         ):
-            print("\nRunning the official Tailscale installer (you may be asked for your sudo password)...\n")
-            code = _run_visible(["sh", "-c", "curl -fsSL https://tailscale.com/install.sh | sh"])
-            if code != 0:
-                raise PortBridgeError(
-                    "The Tailscale install script did not finish successfully.",
-                    "Try it manually: curl -fsSL https://tailscale.com/install.sh | sh",
-                )
-            probe = core.probe_tailscale()
-            if probe.tailscale_installed:
-                print("\nTailscale installed.")
-        if not probe.tailscale_installed:
-            raise TailscaleNotInstalledError()
+            install_dir = Path.home() / ".local" / "bin"
+            print(f"\nDownloading frpc into {install_dir}...")
+            relay_mod.install_frpc(install_dir)
+            print("frpc installed.")
+            probe = core.probe_relay(cfg, check_reachable=False)
+        if not probe.frpc_installed:
+            raise FrpcNotInstalledError()
 
-    if not probe.daemon_reachable:
-        print("\nThe tailscaled background service isn't running.")
-        if _confirm_system_change(
-            "Start it now (and enable it at boot) with "
-            "'sudo systemctl enable --now tailscaled'?", assume_yes
-        ):
-            code = _run_visible(["sudo", "systemctl", "enable", "--now", "tailscaled"])
-            if code != 0:
-                print("  systemctl reported a problem; check: sudo systemctl status tailscaled")
-            time.sleep(1)
-            probe = core.probe_tailscale()
-        if not probe.daemon_reachable:
-            raise TailscaleDaemonUnreachableError(probe.status_error or "")
+    missing = _missing_relay_fields(cfg)
+    if missing:
+        raise RelayNotConfiguredError(missing)
 
-    if not probe.version_ok:
-        print(
-            f"\nWarning: installed tailscale ({probe.tailscale_version}) is older "
-            f"than the {ts.MIN_VERSION} minimum Funnel requires; continuing anyway.\n"
-            "  Upgrade with: curl -fsSL https://tailscale.com/install.sh | sh"
-        )
-
-    if not probe.authenticated:
-        print("\nThis machine is not logged in to a Tailscale account.")
-        print("This step needs you: it opens a browser link tied to your identity")
-        print("(Google/Microsoft/GitHub/Apple/passkey) -- PortBridge never handles that itself.")
-        if _confirm_system_change("Run 'tailscale up' now and open the login link?", assume_yes):
-            ts.login_interactive()
-            probe = core.probe_tailscale()
-        if not probe.authenticated:
-            raise NotAuthenticatedError()
-
-    if not probe.connected:
-        raise NetworkUnavailableError("tailscale reports this device as offline")
-
-    if probe.health_problems:
-        print("\nTailscale reports health warnings:")
-        for problem in probe.health_problems:
-            print(f"  - {problem}")
+    relay = cfg["relay"]
+    timeout = cfg["behavior"]["connect_timeout_seconds"]
+    ok, msg = netcheck.tcp_connect_test(relay["server_addr"], relay["server_port"], timeout=timeout)
+    probe.relay_reachable = ok
+    if not ok:
+        raise RelayConnectionError(relay["server_addr"], relay["server_port"], msg)
 
     return probe
 
 
 def do_setup(assume_yes: bool = False) -> int:
     print(ui.box(["PORTBRIDGE SETUP"]))
-    print("\nChecking Tailscale...")
+    cfg = config_mod.load_config()
 
-    probe = ensure_tailscale_ready(assume_yes=assume_yes)
-    print("\n✓ Tailscale is installed, running, authenticated, and connected.")
-    if probe.dns_name:
-        print(f"  This device's tailnet hostname: {probe.dns_name}")
+    print("\nChecking frpc...")
+    probe = core.probe_relay(cfg, check_reachable=False)
+    if not probe.frpc_installed:
+        print("frpc isn't installed yet. PortBridge needs it to run the tunnel client.")
+        if _confirm_system_change(
+            "Install it now (downloads the frpc release for this machine's CPU architecture)?",
+            assume_yes,
+        ):
+            install_dir = Path.home() / ".local" / "bin"
+            print(f"\nDownloading frpc into {install_dir}...")
+            relay_mod.install_frpc(install_dir)
+            print("frpc installed.")
+            probe = core.probe_relay(cfg, check_reachable=False)
+        if not probe.frpc_installed:
+            raise FrpcNotInstalledError()
+    print(f"✓ frpc installed ({probe.frpc_version}).")
 
-    if os.geteuid() != 0:
-        user = getpass.getuser()
-        print(
-            "\nOptional: PortBridge's background auto-reconnect cannot type a sudo\n"
-            "password, so if it's ever needed, it will fail silently unless this\n"
-            f"user ('{user}') is set as the Tailscale operator."
-        )
-        if _confirm_system_change(f"Set '{user}' as the Tailscale operator now?", assume_yes):
-            result = ts.set_operator(user)
-            if result.returncode == 0:
-                print("  Operator set.")
-            else:
-                print(f"  Could not set it automatically ({result.stderr.strip()}).")
-                print(f"  Run manually: sudo tailscale set --operator={user}")
+    if not config_mod.relay_configured(cfg):
+        if sys.stdin.isatty():
+            print(
+                "\nNo relay is configured yet. PortBridge needs a relay's address and\n"
+                "ports to tunnel through -- see README for how to deploy one (a small\n"
+                "frps server + bridge, e.g. on Railway's TCP Proxy, fronting your own\n"
+                "machine). Enter its details:"
+            )
+            relay = cfg["relay"]
+            relay["server_addr"] = ui.ask("Relay control address (frps host)", relay["server_addr"] or None)
+            relay["server_port"] = ui.ask_port("Relay control port (frps bindPort)", relay["server_port"] or None)
+            relay["remote_port"] = ui.ask_port(
+                "Relay internal data port (frps allowPorts)", relay["remote_port"] or None
+            )
+            relay["public_addr"] = ui.ask(
+                "Public address remote clients connect to", relay["public_addr"] or None
+            )
+            relay["public_port"] = ui.ask_port("Public port remote clients connect to", relay["public_port"] or None)
+            config_mod.save_config(cfg)
+            print("Relay settings saved.")
+        if not config_mod.relay_configured(cfg):
+            raise RelayNotConfiguredError(_missing_relay_fields(cfg))
 
-    print(
-        "\nOne thing PortBridge cannot check or fix for you (it lives in your\n"
-        "Tailscale account's policy, not on this device): Funnel must be allowed\n"
-        "for this device in your tailnet's ACL policy file. New tailnets allow it\n"
-        "by default -- if 'portbridge start' later reports a Funnel/ACL error,\n"
-        "fix it here:\n"
-        f"  1. Open: {ADMIN_ACL_URL}\n"
-        "  2. Make sure the policy includes:\n"
-        '       "nodeAttrs": [\n'
-        '         { "target": ["autogroup:member"], "attr": ["funnel"] }\n'
-        "       ]\n"
-        "  3. Save."
-    )
+    if not config_mod.load_relay_token():
+        print("\nNo relay auth token is configured yet.")
+        if sys.stdin.isatty():
+            token = ui.ask("Relay auth token (from your frps deployment)")
+            if token:
+                config_mod.save_relay_token(token)
+                print(f"Token saved to {paths.relay_token_file()} (kept out of config.toml).")
+        if not config_mod.load_relay_token():
+            raise RelayNotConfiguredError(["relay_token"])
 
-    print("\nSetup check complete. You're ready to run: portbridge start --port <PORT>")
+    relay = cfg["relay"]
+    timeout = cfg["behavior"]["connect_timeout_seconds"]
+    print(f"\nChecking the relay is reachable at {relay['server_addr']}:{relay['server_port']}...")
+    ok, msg = netcheck.tcp_connect_test(relay["server_addr"], relay["server_port"], timeout=timeout)
+    if ok:
+        print(f"✓ {msg}")
+    else:
+        raise RelayConnectionError(relay["server_addr"], relay["server_port"], msg)
+
+    print(f"\nSetup check complete. Public endpoint: {relay['public_addr']}:{relay['public_port']}")
+    print("You're ready to run: portbridge start --port <PORT>")
     return 0
 
 
@@ -189,9 +185,7 @@ def do_setup(assume_yes: bool = False) -> int:
 
 def do_start(
     local_port: int | None = None,
-    external_port: int | None = None,
     bind: str | None = None,
-    mode: str | None = None,
     foreground: bool = False,
     assume_yes: bool = False,
 ) -> int:
@@ -205,8 +199,8 @@ def do_start(
         print("Forwarding is already active.\n")
         print(f"Local:  {state['bind_address']}:{state['local_port']}")
         public = (
-            f"{state['public_hostname']}:{state['external_port']}"
-            if state.get("public_hostname")
+            f"{state['public_addr']}:{state['public_port']}"
+            if state.get("public_addr")
             else "(unknown)"
         )
         print(f"Public: {public}\n")
@@ -222,7 +216,6 @@ def do_start(
         local_port = ui.ask_port("Enter local listening port", default=default_port)
     else:
         local_port = validation.parse_port(local_port)
-    mode = mode or cfg["provider"]["mode"]
 
     if not netcheck.is_port_listening(bind, local_port):
         print(f"\nWarning: nothing is currently listening on {bind}:{local_port}.")
@@ -232,76 +225,34 @@ def do_start(
             print("Aborted.")
             return 1
 
-    probe = ensure_tailscale_ready(assume_yes=assume_yes)
-
-    requested_external = validation.parse_port(
-        external_port
-        if external_port is not None
-        else (cfg["network"]["external_port"] or config_mod.SUGGESTION_ORDER[0])
-    )
-
-    if requested_external not in config_mod.ALLOWED_EXTERNAL_PORTS:
-        suggestion = config_mod.suggest_external_port(set())
-        print(f"\n  Local port: {local_port}")
-        print(f"  Requested external port: {requested_external}\n")
-        print("  ERROR:")
-        print("  The selected public forwarding mechanism does not support")
-        print(f"  external TCP port {requested_external}.\n")
-        print("  Allowed external ports:")
-        for port in config_mod.ALLOWED_EXTERNAL_PORTS:
-            print(f"    {port}")
-        print()
-        if suggestion is not None and (
-            assume_yes or ui.ask_yes_no(f"  Would you like to use external port {suggestion}?", default=False)
-        ):
-            external_port = suggestion
-        else:
-            print("\nAborted -- no external port selected.")
-            return 1
-    else:
-        external_port = requested_external
-
-    if core.probe_funnel_mapped(external_port):
-        print(f"\nExternal port {external_port} already has an active Funnel mapping on this device.")
-        if not (assume_yes or ui.ask_yes_no(
-            "Reset ALL existing Funnel/Serve mappings on this device and take it over?", default=False
-        )):
-            raise ExternalPortInUseError(external_port, "an existing mapping")
-        ts.funnel_reset(allow_sudo=True)
-
-    print("\nApplying funnel configuration...")
-    core.apply_funnel(bind, local_port, external_port, mode, allow_sudo=True)
+    ensure_relay_ready(cfg, assume_yes=assume_yes)
+    relay = cfg["relay"]
 
     new_state = state_mod.default_state()
     new_state.update({
         "status": state_mod.STARTING,
         "bind_address": bind,
         "local_port": local_port,
-        "external_port": external_port,
-        "mode": mode,
-        "public_hostname": probe.dns_name,
+        "public_addr": relay["public_addr"],
+        "public_port": relay["public_port"],
         "started_at": time.time(),
     })
     state_mod.save_state(new_state)
 
     cfg["network"]["bind_address"] = bind
     cfg["network"]["local_port"] = local_port
-    cfg["network"]["external_port"] = external_port
-    cfg["provider"]["mode"] = mode
     config_mod.save_config(cfg)
 
     if foreground:
-        new_state["pid"] = os.getpid()
-        new_state["status"] = state_mod.ACTIVE
-        state_mod.save_state(new_state)
-        print(
-            f"\nForwarding active (foreground). Local {bind}:{local_port} -> "
-            f"public {probe.dns_name}:{external_port}\nPress Ctrl+C to stop.\n"
-        )
+        new_state["pid"] = None  # monitor.run_loop sets this once frpc is up
         logger = logging_setup.get_logger(
             cfg["logging"]["level"], cfg["logging"]["max_bytes"], cfg["logging"]["backup_count"]
         )
-        monitor.run_loop(cfg, logger)
+        print(
+            f"\nForwarding active (foreground). Local {bind}:{local_port} -> "
+            f"public {relay['public_addr']}:{relay['public_port']}\nPress Ctrl+C to stop.\n"
+        )
+        monitor.start_and_run(cfg, logger)
         return 0
 
     try:
@@ -314,12 +265,17 @@ def do_start(
     # The detached child (monitor.entrypoint) takes ownership of state.json
     # from here: it records its own PID and flips status to ACTIVE itself.
     # We deliberately do not write state.json again here -- doing so with
-    # this stale in-memory copy would race the child's own write and could
-    # clobber ACTIVE back to STARTING, which would make the monitor think
-    # it was told to stop on its very next health-check loop iteration.
+    # this stale in-memory copy would race the child's own write.
+    time.sleep(1.5)  # give frpc a moment to fail fast (bad token, unreachable relay)
+    final_state = state_mod.load_state()
+    if final_state.get("status") == state_mod.FAILED:
+        raise PortBridgeError(
+            f"frpc failed to start: {final_state.get('last_error') or 'unknown error'}",
+            "Check: portbridge logs",
+        )
     print("\nForwarding started.\n")
     print(f"  Local:  {bind}:{local_port}")
-    print(f"  Public: {probe.dns_name}:{external_port}\n")
+    print(f"  Public: {relay['public_addr']}:{relay['public_port']}\n")
     return 0
 
 
@@ -337,33 +293,14 @@ def do_stop(quiet: bool = False) -> int:
         if not ok and not quiet:
             print("Warning: monitor process did not exit cleanly; forcing cleanup anyway.")
 
-    removal_confirmed = True
-    try:
-        core.remove_funnel(
-            state["bind_address"], state["local_port"], state["external_port"],
-            state["mode"], allow_sudo=True,
-        )
-    except PortBridgeError as exc:
-        removal_confirmed = False
-        if not quiet:
-            print(f"Warning: {exc.message}")
-
-    external_port = state.get("external_port")
+    # Killing the monitor kills frpc (its child) as part of its own SIGTERM
+    # cleanup, which is what actually tears down the tunnel -- unlike the
+    # old Tailscale design there's no separate "remove mapping" RPC call
+    # needed. clear_state() here is just a safety net in case the monitor
+    # didn't get to its own cleanup (e.g. the SIGKILL fallback above).
     state_mod.clear_state()
 
     if not quiet:
-        # Tailscale's own remove/off command is authoritative: if it
-        # confirmed removal (or that there was nothing to remove), trust
-        # that instead of also running the heuristic `funnel status`
-        # text/JSON check below -- its schema isn't documented by Tailscale
-        # and can disagree with the real state, which would otherwise print
-        # a confusing, self-contradicting second warning right after the
-        # first one already said the mapping was gone.
-        if not removal_confirmed and core.probe_funnel_mapped(external_port):
-            print(
-                "Warning: Tailscale may still report a mapping on that port "
-                "(best-effort check). Verify with: tailscale funnel status"
-            )
         print("Forwarding stopped.")
     return 0
 
@@ -374,7 +311,6 @@ def do_restart(assume_yes: bool = False) -> int:
     was_active = state["status"] != state_mod.STOPPED
 
     local_port = state.get("local_port")
-    external_port = state.get("external_port")
 
     if was_active:
         do_stop(quiet=True)
@@ -383,20 +319,12 @@ def do_restart(assume_yes: bool = False) -> int:
     if not local_port:
         cfg = config_mod.load_config()
         local_port = cfg["network"]["local_port"] or None
-        external_port = cfg["network"]["external_port"]
 
-    # bind/mode are deliberately NOT carried over from the old state here:
-    # do_start() falls back to the CURRENT config.toml for those when not
-    # passed explicitly. If we instead resurrected them from state (what
-    # was actually running before), a `portbridge configure --mode ...`/
-    # `--bind ...` change would get silently overwritten back to the old
-    # value on the very next restart -- do_start() re-saves whatever mode
-    # it used back into config.toml, so this previously clobbered a config
-    # change with no indication anything had reverted.
-    return do_start(
-        local_port=local_port, external_port=external_port,
-        assume_yes=assume_yes,
-    )
+    # bind is deliberately NOT carried over from the old state: do_start()
+    # falls back to the CURRENT config.toml when not passed explicitly, so
+    # a `portbridge configure --bind ...` change takes effect on restart
+    # instead of being silently reverted to whatever was running before.
+    return do_start(local_port=local_port, assume_yes=assume_yes)
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +340,10 @@ def do_status() -> int:
 
     print(ui.status_header())
     print()
-    print("VPN/Tunnel:")
-    print(f"  Installed:     {ui.yesno(probe.tailscale_installed)}")
-    print(f"  Authenticated: {ui.yesno(probe.authenticated)}")
-    print(f"  Connected:     {ui.yesno(probe.connected)}")
+    print("Relay client:")
+    print(f"  frpc installed: {ui.yesno(probe.frpc_installed)}")
+    print(f"  Configured:     {ui.yesno(probe.relay_configured)}")
+    print(f"  Reachable:      {ui.yesno(bool(probe.relay_reachable))}")
     print()
     print("Local service:")
     print(f"  Address:   {snap['bind']}")
@@ -430,12 +358,11 @@ def do_status() -> int:
         print(f"  Attempt:  {state.get('reconnect_attempts', 0)}")
         print(f"  Next retry: {remaining} seconds")
     print(f"  Local:    {snap['bind']}:{snap['local_port'] or '-'}")
-    print(f"  External: {snap['external_port'] or '-'}")
     print()
 
-    if probe.dns_name and snap["external_port"]:
+    if state.get("public_addr") and state.get("public_port"):
         print("Public endpoint:")
-        print(f"  {probe.dns_name}:{snap['external_port']}")
+        print(f"  {state['public_addr']}:{state['public_port']}")
         print()
 
     print("Uptime:")
@@ -444,9 +371,8 @@ def do_status() -> int:
 
     print("Health:")
     print(ui.check(
-        probe.connected and probe.authenticated, "Tunnel connected",
-        "; ".join(probe.health_problems) if probe.health_problems
-        else (probe.status_error or "not connected or not authenticated"),
+        probe.relay_configured and probe.relay_reachable is not False, "Relay reachable",
+        probe.status_error or "relay not configured or unreachable",
     ))
     print(ui.check(
         snap["local_listening"], "Local port reachable",
@@ -454,14 +380,9 @@ def do_status() -> int:
         if snap["local_port"] else "no local port configured",
     ))
     print(ui.check(
-        bool(probe.dns_name and snap["external_port"]), "Public endpoint configured",
-        "run 'portbridge start' to configure forwarding",
+        state["status"] == state_mod.ACTIVE, "Tunnel active",
+        f"current status is {state['status']}",
     ))
-    if state["status"] == state_mod.ACTIVE:
-        print(ui.check(
-            snap["funnel_mapped"], "External mapping active on Tailscale",
-            "tailscale no longer reports this external port as funneled",
-        ))
     print()
     if was_stale:
         print("Note: previous forwarding state was stale (crash or reboot) and has been cleared.")
@@ -471,12 +392,10 @@ def do_status() -> int:
 def do_endpoint() -> int:
     state = state_mod.load_state()
     state, _ = state_mod.detect_and_clean_stale(state)
-    if state["status"] != state_mod.ACTIVE and state["status"] != state_mod.RECONNECTING:
+    if state["status"] not in (state_mod.ACTIVE, state_mod.RECONNECTING):
         print("Forwarding is not currently active; no public endpoint configured.")
         return 1
-    probe = core.probe_tailscale()
-    host = probe.dns_name or state.get("public_hostname") or "<unknown>.ts.net"
-    print(f"{host}:{state['external_port']}")
+    print(f"{state['public_addr']}:{state['public_port']}")
     return 0
 
 
@@ -501,22 +420,14 @@ def do_test(check_local: bool = True, check_external: bool = True, port: int | N
         if state["status"] not in (state_mod.ACTIVE, state_mod.RECONNECTING):
             print("Forwarding is not active; skipping external endpoint test.")
         else:
-            probe = core.probe_tailscale()
-            host = probe.dns_name or state.get("public_hostname")
-            if not host or not state.get("external_port"):
+            host = state.get("public_addr")
+            ext_port = state.get("public_port")
+            if not host or not ext_port:
                 print("Public endpoint unknown; cannot test.")
                 ok_all = False
             else:
-                ok, msg = netcheck.tcp_connect_test(host, state["external_port"], timeout=timeout)
+                ok, msg = netcheck.tcp_connect_test(host, ext_port, timeout=timeout)
                 print(("✓ " if ok else "✗ ") + msg)
-                if ok:
-                    print(
-                        "  (This confirms the public port accepts a TCP connection only. "
-                        "Tailscale Funnel requires TLS at its edge even in this mode -- a "
-                        "plain, non-TLS client will connect but get no data through. Use "
-                        "'openssl s_client -connect host:port' or 'ncat --ssl' to test data "
-                        "flow end-to-end.)"
-                    )
                 ok_all = ok_all and ok
 
     return 0 if ok_all else 1
@@ -538,8 +449,13 @@ def do_logs(follow: bool = False, n: int = 50) -> int:
 # configure
 # ---------------------------------------------------------------------------
 
-def do_configure(overrides: dict, interactive_wizard: bool) -> int:
+def do_configure(overrides: dict, interactive_wizard: bool, relay_token: str | None = None) -> int:
     cfg = config_mod.load_config()
+
+    if relay_token is not None:
+        config_mod.save_relay_token(relay_token)
+        print(f"Relay token saved to {paths.relay_token_file()}.")
+
     if interactive_wizard:
         print(ui.box(["CONFIGURE PORTBRIDGE"]))
         print()
@@ -547,11 +463,20 @@ def do_configure(overrides: dict, interactive_wizard: bool) -> int:
         current_local = cfg["network"]["local_port"] or ""
         raw = ui.ask("Default local port (blank = ask each time)", str(current_local) if current_local else "")
         cfg["network"]["local_port"] = validation.parse_port(raw) if raw else 0
-        raw = ui.ask("Default external port", str(cfg["network"]["external_port"]))
-        cfg["network"]["external_port"] = validation.parse_port(raw)
-        raw = ui.ask("Funnel mode (tcp / tls-terminated-tcp)", cfg["provider"]["mode"])
-        if raw in config_mod.FUNNEL_MODES:
-            cfg["provider"]["mode"] = raw
+
+        relay = cfg["relay"]
+        relay["server_addr"] = ui.ask("Relay control address (frps host)", relay["server_addr"] or "")
+        raw = ui.ask("Relay control port", str(relay["server_port"]) if relay["server_port"] else "")
+        if raw:
+            relay["server_port"] = validation.parse_port(raw)
+        raw = ui.ask("Relay internal data port", str(relay["remote_port"]) if relay["remote_port"] else "")
+        if raw:
+            relay["remote_port"] = validation.parse_port(raw)
+        relay["public_addr"] = ui.ask("Public address (what remote clients connect to)", relay["public_addr"] or "")
+        raw = ui.ask("Public port", str(relay["public_port"]) if relay["public_port"] else "")
+        if raw:
+            relay["public_port"] = validation.parse_port(raw)
+
         raw = ui.ask("Health check interval (seconds)", str(cfg["behavior"]["health_check_interval_seconds"]))
         cfg["behavior"]["health_check_interval_seconds"] = int(raw)
         raw = ui.ask("Connect timeout (seconds)", str(cfg["behavior"]["connect_timeout_seconds"]))
@@ -565,12 +490,13 @@ def do_configure(overrides: dict, interactive_wizard: bool) -> int:
         cfg["behavior"]["reconnect_backoff_max_seconds"] = int(raw)
         raw = ui.ask("Log level (DEBUG/INFO/WARNING/ERROR)", cfg["logging"]["level"]).upper()
         cfg["logging"]["level"] = raw
-    else:
+    elif overrides:
         for (section, field), value in overrides.items():
             cfg[section][field] = value
 
-    config_mod.save_config(cfg)
-    print(f"\nSaved to {paths.config_file()}")
+    if interactive_wizard or overrides:
+        config_mod.save_config(cfg)
+        print(f"\nSaved to {paths.config_file()}")
     return 0
 
 
@@ -578,8 +504,11 @@ def _collect_configure_overrides(args: argparse.Namespace) -> dict:
     mapping = {
         "bind": ("network", "bind_address"),
         "local_port": ("network", "local_port"),
-        "external_port": ("network", "external_port"),
-        "mode": ("provider", "mode"),
+        "server_addr": ("relay", "server_addr"),
+        "server_port": ("relay", "server_port"),
+        "remote_port": ("relay", "remote_port"),
+        "public_addr": ("relay", "public_addr"),
+        "public_port": ("relay", "public_port"),
         "health_interval": ("behavior", "health_check_interval_seconds"),
         "connect_timeout": ("behavior", "connect_timeout_seconds"),
         "reconnect": ("behavior", "reconnect"),
@@ -623,20 +552,20 @@ def interactive_menu() -> int:
         cfg = config_mod.load_config()
         state = state_mod.load_state()
         state, _ = state_mod.detect_and_clean_stale(state)
-        probe = core.probe_tailscale()
+        probe = core.probe_relay(cfg)
 
         print()
         print(ui.banner())
         print()
         print("Status:")
-        if probe.tailscale_installed:
-            print(f"  VPN: {'Connected' if probe.connected else 'Not connected'}")
+        if probe.frpc_installed:
+            print(f"  Relay client: {'Configured' if probe.relay_configured else 'Not configured'}")
         else:
-            print("  VPN: Not installed")
-        print(f"  Public endpoint: {'Available' if probe.dns_name else 'Unavailable'}")
+            print("  Relay client: Not installed")
+        print(f"  Public endpoint: {'Available' if probe.relay_configured else 'Unavailable'}")
         print(f"  Forwarding: {_FORWARDING_LABEL.get(state['status'], state['status'])}")
-        if not (probe.tailscale_installed and probe.authenticated and probe.connected):
-            print("\n  Tailscale isn't fully set up yet -- choose 10) Setup check to fix it.")
+        if not (probe.frpc_installed and probe.relay_configured):
+            print("\n  Relay isn't fully set up yet -- choose 10) Setup check to fix it.")
         print()
         print("Choose an option:\n")
         print("  1) Start port forwarding")
@@ -648,7 +577,7 @@ def interactive_menu() -> int:
         print("  7) View logs")
         print("  8) Restart forwarding")
         print("  9) Configure")
-        print(" 10) Setup check (install/authenticate Tailscale)")
+        print(" 10) Setup check (install frpc / configure relay)")
         print("  0) Exit")
         print()
         try:
@@ -706,9 +635,8 @@ def interactive_menu() -> int:
 _EPILOG = """\
 Examples:
   portbridge                                 Launch the interactive menu
-  portbridge setup                           Check/install/authenticate Tailscale
+  portbridge setup                           Check/install frpc, configure the relay
   portbridge start --port 9001               Forward local port 9001
-  portbridge start --port 9001 --external-port 8443
   portbridge stop                            Stop forwarding
   portbridge status                          Detailed status report
   portbridge endpoint                        Print host:port of the public endpoint
@@ -717,6 +645,7 @@ Examples:
   portbridge logs --follow                   Tail the log file live
   portbridge restart                         Stop then start with stored config
   portbridge configure                       Interactive configuration wizard
+  portbridge configure --relay-token <token> Set the relay auth token
   portbridge listen --port 9001              Disposable test TCP echo server
 
 Config file: ~/.config/portbridge/config.toml
@@ -728,8 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="portbridge",
         description="Manage TCP port forwarding from this Linux machine to the "
-                     "public internet via Tailscale Funnel, without requiring the "
-                     "remote machine to install any VPN client.",
+                     "public internet through your own relay (frpc/frps), without "
+                     "requiring the remote machine to install any VPN client.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -740,9 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_start = sub.add_parser("start", help="Start TCP port forwarding")
     p_start.add_argument("--port", type=int, help="Local port to forward")
-    p_start.add_argument("--external-port", type=int, help="Requested public/external port")
     p_start.add_argument("--bind", help="Local bind address (default: 127.0.0.1)")
-    p_start.add_argument("--mode", choices=config_mod.FUNNEL_MODES, help="Funnel mode")
     p_start.add_argument(
         "--foreground", action="store_true",
         help="Run in the foreground instead of detaching (for systemd/Type=simple)",
@@ -750,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("-y", "--yes", action="store_true", help="Assume yes on prompts")
 
     p_setup = sub.add_parser(
-        "setup", help="Check/install Tailscale and fix common setup gaps interactively"
+        "setup", help="Check/install frpc and configure the relay interactively"
     )
     p_setup.add_argument("-y", "--yes", action="store_true", help="Assume yes on prompts")
 
@@ -773,8 +700,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_configure = sub.add_parser("configure", help="View or edit configuration")
     p_configure.add_argument("--bind")
     p_configure.add_argument("--local-port", type=int)
-    p_configure.add_argument("--external-port", type=int)
-    p_configure.add_argument("--mode", choices=config_mod.FUNNEL_MODES)
+    p_configure.add_argument("--server-addr", help="Relay control address (frps host)")
+    p_configure.add_argument("--server-port", type=int, help="Relay control port")
+    p_configure.add_argument("--remote-port", type=int, help="Relay internal data port")
+    p_configure.add_argument("--public-addr", help="Public address remote clients connect to")
+    p_configure.add_argument("--public-port", type=int, help="Public port remote clients connect to")
+    p_configure.add_argument("--relay-token", help="Relay auth token (stored outside config.toml)")
     p_configure.add_argument("--health-interval", type=int)
     p_configure.add_argument("--connect-timeout", type=int)
     p_configure.add_argument("--reconnect", dest="reconnect", action="store_true", default=None)
@@ -815,8 +746,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "start":
             return do_start(
-                local_port=args.port, external_port=args.external_port, bind=args.bind,
-                mode=args.mode, foreground=args.foreground, assume_yes=args.yes,
+                local_port=args.port, bind=args.bind,
+                foreground=args.foreground, assume_yes=args.yes,
             )
         if args.command == "setup":
             return do_setup(assume_yes=args.yes)
@@ -836,7 +767,8 @@ def main(argv: list[str] | None = None) -> int:
             return do_restart(assume_yes=args.yes)
         if args.command == "configure":
             overrides = _collect_configure_overrides(args)
-            return do_configure(overrides, interactive_wizard=not overrides)
+            interactive = not overrides and args.relay_token is None
+            return do_configure(overrides, interactive_wizard=interactive, relay_token=args.relay_token)
         if args.command == "listen":
             return do_listen(args.bind, args.port)
         if args.command == "_monitor":

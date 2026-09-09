@@ -1,9 +1,8 @@
 [Unit]
-Description=PortBridge TCP forwarding (Tailscale Funnel)
-Documentation=https://tailscale.com/kb/1223/funnel
-After=network-online.target tailscaled.service
+Description=PortBridge TCP forwarding (frpc relay client)
+Documentation=https://github.com/devman-011/portbridge
+After=network-online.target
 Wants=network-online.target
-Requires=tailscaled.service
 
 [Service]
 Type=simple
@@ -15,12 +14,11 @@ RestartSec=5
 KillMode=mixed
 TimeoutStopSec=10
 
-# PortBridge itself never needs elevated privileges beyond what running
-# `tailscale funnel`/`tailscale up` requires. If this user is not root and
-# has not been made a Tailscale operator (sudo tailscale set
-# --operator=<user>), reconnect attempts made by this service will fail
-# with a permission error rather than hang, since the background monitor
-# never attempts an interactive sudo prompt.
+# PortBridge runs `frpc` as a plain subprocess -- no elevated privileges
+# needed at all, unlike the old Tailscale-based design. Make sure
+# `portbridge configure` has a local port and relay settings saved (and
+# `portbridge configure --relay-token ...` has been run) before enabling
+# this unit, since ExecStart has no interactive prompts available to it.
 
 [Install]
 WantedBy=multi-user.target

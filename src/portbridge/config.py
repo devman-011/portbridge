@@ -1,9 +1,8 @@
 """Config file (config.toml) loading, defaults, validation, and saving.
 
-No secrets are ever stored here. Tailscale authentication is delegated
-entirely to `tailscale up` / `tailscale login`, which persist their own
-credentials inside tailscaled's state directory -- PortBridge never sees or
-stores an auth key beyond passing it straight through to that one command.
+The relay auth token is the one real secret PortBridge needs, and it is
+deliberately kept OUT of this file -- see paths.relay_token_file() and
+relay.py. Everything in config.toml is safe to read, share, or commit.
 """
 
 from __future__ import annotations
@@ -20,39 +19,28 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
-# The one fact that gates everything else in this tool: Tailscale Funnel can
-# only publish these three fixed external TCP ports. Verified against
-# https://tailscale.com/kb/1223/funnel and the CLI reference at
-# https://tailscale.com/docs/reference/tailscale-cli/funnel (September 2026).
-ALLOWED_EXTERNAL_PORTS = (443, 8443, 10000)
-# Preference order when suggesting a substitute port: keep 443/8443 free for
-# real HTTPS services where possible, offer the generic port first.
-SUGGESTION_ORDER = (10000, 8443, 443)
-
-FUNNEL_MODES = ("tcp", "tls-terminated-tcp")
-
 DEFAULT_CONFIG: dict[str, Any] = {
     "network": {
         "bind_address": "127.0.0.1",
         "local_port": 0,
-        "external_port": 10000,
     },
-    "provider": {
-        "name": "tailscale-funnel",
-        # Tailscale's own docs state plainly that "Funnel only works over
-        # TLS-encrypted connections" -- this applies to --tcp too, not just
-        # HTTPS mode. --tcp ("raw") only means Tailscale passes the TLS
-        # bytes through undecrypted; the connecting client still MUST
-        # speak TLS to get past Tailscale's edge at all, so a genuinely
-        # plain client (nc, a game client, ...) gets nothing through it.
-        # tls-terminated-tcp is the mode that actually works with an
-        # ordinary, non-TLS local service: Tailscale terminates the
-        # mandatory TLS at its edge and hands your local service plain
-        # bytes -- only the *remote* client needs a TLS-capable tool
-        # (e.g. `ncat --ssl`, `openssl s_client`), your local side is
-        # unaffected. See https://github.com/tailscale/tailscale/issues/14240
-        # for another user hitting this with a plain TCP (Minecraft) client.
-        "mode": "tls-terminated-tcp",
+    "relay": {
+        # frps's control address/port -- where frpc connects to register
+        # the tunnel. Left blank until 'portbridge setup' or 'configure'
+        # fills these in from your own deployed relay (see README for how
+        # to deploy one -- it's a small frps + socat pair on any host with
+        # a public TCP port, e.g. Railway's TCP Proxy).
+        "server_addr": "",
+        "server_port": 0,
+        # The port frps listens on internally for this tunnel's data --
+        # matches allowPorts in frps.toml and the socat/relay bridge in
+        # front of it.
+        "remote_port": 0,
+        # What remote clients actually connect to -- may differ from
+        # server_addr/server_port if, like the reference deployment, a
+        # separate bridge service fronts the actual data port.
+        "public_addr": "",
+        "public_port": 0,
     },
     "behavior": {
         "auto_start": False,
@@ -126,8 +114,33 @@ def save_config(cfg: dict) -> None:
     os.replace(tmp, path)
 
 
-def suggest_external_port(in_use: set[int]) -> int | None:
-    for port in SUGGESTION_ORDER:
-        if port not in in_use:
-            return port
-    return None
+def relay_configured(cfg: dict) -> bool:
+    relay = cfg["relay"]
+    return bool(
+        relay["server_addr"] and relay["server_port"]
+        and relay["remote_port"] and relay["public_addr"] and relay["public_port"]
+    )
+
+
+def load_relay_token() -> str | None:
+    path = paths.relay_token_file()
+    if not path.exists():
+        return None
+    token = path.read_text(encoding="utf-8").strip()
+    return token or None
+
+
+def save_relay_token(token: str) -> None:
+    paths.ensure_dirs()
+    path = paths.relay_token_file()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(token.strip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass

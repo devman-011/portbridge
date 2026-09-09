@@ -1,36 +1,64 @@
 """The background health-check / auto-reconnect loop.
 
-Runs either as a detached child (spawned by `portbridge start`, entered via
-the hidden `portbridge _monitor` subcommand) or in-process when the caller
-used `portbridge start --foreground` (e.g. under systemd). Either way, by
-the time this loop starts, the initial `tailscale funnel` mapping has
-already been applied by the caller -- this module's only jobs are: watch
-health, reconnect the *tunnel* with backoff if it drops, and clean up on
-SIGTERM/SIGINT.
+Unlike the old Tailscale-based design (where tailscaled ran independently
+and PortBridge just sent it config), frpc IS the tunnel client and must
+stay running continuously -- if the process exits, the tunnel is gone.
+This loop's main job is supervising frpc as a child process: start it,
+watch that it's still alive, restart it with backoff if it dies. frpc has
+its own internal reconnect logic for transient network drops, so this
+loop mainly reacts to the frpc *process* disappearing, not brief blips.
 
-It deliberately treats "local service not listening" as informational only
--- PortBridge never restarts, pokes, or otherwise interferes with whatever
-is listening on the local port (or isn't).
+Runs either as a detached child (spawned by `portbridge start`, entered
+via the hidden `portbridge _monitor` subcommand) or in-process when the
+caller used `portbridge start --foreground` (e.g. under systemd).
+
+Local-service-down is deliberately informational only -- PortBridge never
+restarts, pokes, or otherwise interferes with whatever is listening on the
+local port (or isn't).
 """
 
 from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import time
 
 from portbridge import config as config_mod
 from portbridge import core
 from portbridge import logging_setup
+from portbridge import paths
+from portbridge import relay as relay_mod
 from portbridge import state as state_mod
 from portbridge.errors import PortBridgeError
 
 _stop_requested = False
+_frpc_proc: subprocess.Popen | None = None
 
 
 def _handle_signal(signum, frame):
     global _stop_requested
     _stop_requested = True
+
+
+def start_and_run(cfg: dict, logger) -> None:
+    """Shared by the detached-child entrypoint() and `portbridge start
+    --foreground`: loads state (already written by do_start() with
+    local_port/public_addr/etc.), claims it with our own PID, and runs the
+    supervision loop."""
+    state = state_mod.load_state()
+    if not state.get("local_port") or not state.get("public_port"):
+        logger.error("Monitor started with no active configuration in state.json; exiting.")
+        return
+    state["pid"] = os.getpid()
+    state["status"] = state_mod.ACTIVE
+    state_mod.save_state(state)
+    logger.info(
+        "Monitor started (pid=%s) forwarding %s:%s -> %s:%s",
+        os.getpid(), state["bind_address"], state["local_port"],
+        state["public_addr"], state["public_port"],
+    )
+    run_loop(cfg, logger, state)
 
 
 def entrypoint() -> int:
@@ -39,51 +67,49 @@ def entrypoint() -> int:
     logger = logging_setup.get_logger(
         logging_cfg["level"], logging_cfg["max_bytes"], logging_cfg["backup_count"]
     )
-    state = state_mod.load_state()
-    if not state.get("local_port") or not state.get("external_port"):
-        logger.error("Monitor started with no active configuration in state.json; exiting.")
-        return 1
-    state["pid"] = os.getpid()
-    state["status"] = state_mod.ACTIVE
-    state_mod.save_state(state)
-    logger.info(
-        "Monitor started (pid=%s) forwarding %s:%s -> external port %s",
-        os.getpid(), state["bind_address"], state["local_port"], state["external_port"],
-    )
-    run_loop(cfg, logger)
+    start_and_run(cfg, logger)
     return 0
 
 
-def _check_health(state: dict) -> tuple[list[str], list[str]]:
-    """Returns (tunnel_problems, local_problems). Only tunnel_problems
-    drive reconnect behavior."""
-    tunnel_problems: list[str] = []
-    probe = core.probe_tailscale()
-    tunnel_problems.extend(core.funnel_prereqs(probe))
-    mapped = core.probe_funnel_mapped(state["external_port"])
-    if mapped is False:
-        tunnel_problems.append(f"external port {state['external_port']} is no longer funneled")
+def _start_frpc(cfg: dict, state: dict, logger) -> subprocess.Popen | None:
+    token = config_mod.load_relay_token()
+    if not token:
+        logger.error("No relay token configured (portbridge configure --relay-token ...); cannot start frpc.")
+        return None
+    config_path = paths.frpc_config_file()
+    relay_mod.write_frpc_config(
+        config_path,
+        server_addr=cfg["relay"]["server_addr"],
+        server_port=cfg["relay"]["server_port"],
+        remote_port=cfg["relay"]["remote_port"],
+        token=token,
+        bind_address=state["bind_address"],
+        local_port=state["local_port"],
+    )
+    paths.ensure_dirs()
+    log_fh = open(paths.log_file(), "a", encoding="utf-8")
+    try:
+        proc = relay_mod.spawn_frpc(config_path, log_fh)
+    except PortBridgeError as exc:
+        logger.error("Could not start frpc: %s", exc.message)
+        return None
+    finally:
+        log_fh.close()  # the child holds its own duplicated fd
+    return proc
 
-    local_problems: list[str] = []
+
+def _check_local(state: dict) -> list[str]:
     local_ok = core.probe_local(state["bind_address"], state["local_port"])
     if local_ok is False:
-        local_problems.append(
+        return [
             f"local service not listening on {state['bind_address']}:{state['local_port']} "
             "(PortBridge will not touch it -- start your local service)"
-        )
-    return tunnel_problems, local_problems
+        ]
+    return []
 
 
-def _sleep_interruptible(seconds: float) -> bool:
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        if _stop_requested:
-            return True
-        time.sleep(min(0.5, max(0.0, end - time.monotonic())))
-    return _stop_requested
-
-
-def run_loop(cfg: dict, logger) -> None:
+def run_loop(cfg: dict, logger, initial_state: dict) -> None:
+    global _frpc_proc
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     behavior = cfg["behavior"]
@@ -92,6 +118,15 @@ def run_loop(cfg: dict, logger) -> None:
     cap = behavior["reconnect_backoff_max_seconds"]
     max_attempts = behavior["reconnect_max_attempts"]
 
+    _frpc_proc = _start_frpc(cfg, initial_state, logger)
+    if _frpc_proc is None:
+        state = state_mod.load_state()
+        state["status"] = state_mod.FAILED
+        state["last_error"] = "frpc failed to start"
+        state_mod.save_state(state)
+        logger.error("frpc failed to start on first attempt; monitor exiting.")
+        return
+
     try:
         while not _stop_requested:
             state = state_mod.load_state()
@@ -99,14 +134,15 @@ def run_loop(cfg: dict, logger) -> None:
                 logger.info("State changed externally (status=%s); monitor exiting.", state.get("status"))
                 return
 
-            tunnel_problems, local_problems = _check_health(state)
+            frpc_alive = _frpc_proc is not None and _frpc_proc.poll() is None
+            local_problems = _check_local(state)
             now = time.time()
             state["last_health_check"] = now
-            state["health_detail"] = tunnel_problems + local_problems
 
-            if not tunnel_problems:
+            if frpc_alive:
                 state["status"] = state_mod.ACTIVE
                 state["health_ok"] = not local_problems
+                state["health_detail"] = local_problems
                 state["reconnect_attempts"] = 0
                 state["next_retry_at"] = None
                 state_mod.save_state(state)
@@ -118,12 +154,13 @@ def run_loop(cfg: dict, logger) -> None:
                     break
                 continue
 
-            logger.warning("Tunnel health check failed: %s", "; ".join(tunnel_problems))
+            logger.warning("frpc is not running (process exited).")
             state["health_ok"] = False
+            state["health_detail"] = ["frpc process exited"] + local_problems
 
             if not behavior["reconnect"]:
                 state["status"] = state_mod.FAILED
-                state["last_error"] = "; ".join(tunnel_problems)
+                state["last_error"] = "frpc exited and reconnect is disabled"
                 state_mod.save_state(state)
                 logger.error("Reconnect disabled in config; giving up.")
                 return
@@ -131,10 +168,7 @@ def run_loop(cfg: dict, logger) -> None:
             attempt = state.get("reconnect_attempts", 0) + 1
             if max_attempts and attempt > max_attempts:
                 state["status"] = state_mod.FAILED
-                state["last_error"] = (
-                    f"Gave up after {max_attempts} reconnect attempts: "
-                    + "; ".join(tunnel_problems)
-                )
+                state["last_error"] = f"Gave up after {max_attempts} reconnect attempts (frpc kept exiting)"
                 state_mod.save_state(state)
                 logger.error("Max reconnect attempts (%s) reached; giving up.", max_attempts)
                 return
@@ -149,47 +183,39 @@ def run_loop(cfg: dict, logger) -> None:
             if _sleep_interruptible(delay):
                 break
 
-            try:
-                core.apply_funnel(
-                    state["bind_address"], state["local_port"], state["external_port"],
-                    state["mode"], allow_sudo=False,
-                )
-                logger.info("Reconnect attempt %s succeeded.", attempt)
-            except PortBridgeError as exc:
-                logger.warning("Reconnect attempt %s failed: %s", attempt, exc.message)
+            _frpc_proc = _start_frpc(cfg, state, logger)
+            if _frpc_proc is not None:
+                logger.info("Reconnect attempt %s: frpc restarted.", attempt)
+            else:
+                logger.warning("Reconnect attempt %s: frpc failed to start.", attempt)
     finally:
         _cleanup(logger)
 
 
+def _sleep_interruptible(seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if _stop_requested:
+            return True
+        time.sleep(min(0.5, max(0.0, end - time.monotonic())))
+    return _stop_requested
+
+
 def _cleanup(logger) -> None:
+    global _frpc_proc
+    if _frpc_proc is not None and _frpc_proc.poll() is None:
+        try:
+            _frpc_proc.terminate()
+            _frpc_proc.wait(timeout=5)
+        except Exception:
+            try:
+                _frpc_proc.kill()
+                _frpc_proc.wait(timeout=5)
+            except Exception:
+                pass
+        logger.info("frpc stopped.")
+
     state = state_mod.load_state()
     if state.get("pid") == os.getpid():
-        try:
-            core.remove_funnel(
-                state["bind_address"], state["local_port"], state["external_port"],
-                state["mode"], allow_sudo=False,
-            )
-            logger.info("Funnel mapping removed on shutdown.")
-            state_mod.clear_state()
-        except PortBridgeError as exc:
-            # allow_sudo=False here on purpose (no TTY to prompt on) means
-            # this commonly fails with a plain permission error when the
-            # user hasn't been made a Tailscale operator. Don't clear state
-            # to STOPPED in that case -- that would make PortBridge believe
-            # forwarding is off while the real Funnel mapping is still
-            # live, and a later `portbridge stop` would short-circuit on
-            # "not currently active" without ever attempting the
-            # sudo-elevated removal that could actually finish the job.
-            # Marking FAILED (not STOPPED) while keeping bind/port/mode
-            # lets a later `portbridge stop`/`start` find and finish this.
-            logger.warning(
-                "Could not remove funnel mapping on shutdown (%s). Leaving "
-                "state as FAILED (not STOPPED) so a later 'portbridge "
-                "stop' can retry with sudo instead of silently believing "
-                "forwarding is already off.", exc.message,
-            )
-            state["pid"] = None
-            state["status"] = state_mod.FAILED
-            state["last_error"] = f"Cleanup on shutdown could not remove the Funnel mapping: {exc.message}"
-            state_mod.save_state(state)
+        state_mod.clear_state()
     logger.info("Monitor stopped (pid=%s).", os.getpid())

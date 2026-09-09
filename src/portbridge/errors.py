@@ -33,41 +33,36 @@ class PortInUseError(PortBridgeError):
         )
 
 
-class TailscaleNotInstalledError(PortBridgeError):
+class FrpcNotInstalledError(PortBridgeError):
     def __init__(self):
         super().__init__(
-            "The 'tailscale' CLI is not installed (or not on PATH).",
-            "Install it with: curl -fsSL https://tailscale.com/install.sh | sh",
+            "The 'frpc' relay client is not installed (or not on PATH).",
+            "Run 'portbridge setup' to install it, or download it manually "
+            "from https://github.com/fatedier/frp/releases",
         )
 
 
-class TailscaleDaemonUnreachableError(PortBridgeError):
-    def __init__(self, detail: str = ""):
-        msg = "Could not reach the tailscaled daemon."
+class RelayNotConfiguredError(PortBridgeError):
+    def __init__(self, missing: list[str] | None = None):
+        detail = f" Missing: {', '.join(missing)}." if missing else ""
+        super().__init__(
+            f"No relay is configured yet.{detail}",
+            "Run 'portbridge configure' to set your relay's address/port "
+            "and 'portbridge configure --relay-token <token>' for its auth "
+            "token. See README for how to deploy your own relay.",
+        )
+
+
+class RelayConnectionError(PortBridgeError):
+    def __init__(self, server_addr: str, server_port: int, detail: str = ""):
+        msg = f"Could not reach the relay at {server_addr}:{server_port}."
         if detail:
             msg += f" ({detail})"
         super().__init__(
             msg,
-            "Check it's running with: sudo systemctl status tailscaled "
-            "-- or start it with: sudo systemctl start tailscaled",
+            "Check the relay deployment is running and the address/port in "
+            "'portbridge configure' are correct.",
         )
-
-
-class NotAuthenticatedError(PortBridgeError):
-    def __init__(self):
-        super().__init__(
-            "This machine is not logged in to a Tailscale account.",
-            "Run: sudo tailscale up  (or 'portbridge start' will offer to "
-            "do this for you interactively)",
-        )
-
-
-class NetworkUnavailableError(PortBridgeError):
-    def __init__(self, detail: str = ""):
-        msg = "This machine appears to be offline."
-        if detail:
-            msg += f" ({detail})"
-        super().__init__(msg, "Check your network connection: ip addr; ping -c1 1.1.1.1")
 
 
 class DNSFailureError(PortBridgeError):
@@ -75,16 +70,6 @@ class DNSFailureError(PortBridgeError):
         super().__init__(
             f"DNS resolution failed for '{hostname}'.",
             f"Try: getent hosts {hostname}  -- or: dig {hostname}",
-        )
-
-
-class ExternalPortInUseError(PortBridgeError):
-    def __init__(self, port, other_local_port):
-        super().__init__(
-            f"External port {port} is already funneled to local port "
-            f"{other_local_port} by an existing PortBridge/Tailscale config.",
-            "Stop it first with 'portbridge stop', or choose a different "
-            "external port.",
         )
 
 
@@ -106,10 +91,10 @@ class MissingExecutableError(PortBridgeError):
 
 class ServiceUnavailableError(PortBridgeError):
     def __init__(self, detail: str = ""):
-        msg = "The Tailscale CLI did not respond in time."
+        msg = "The relay client did not respond in time."
         if detail:
             msg += f" ({detail})"
-        super().__init__(msg, "Try again, or check: sudo systemctl status tailscaled")
+        super().__init__(msg, "Try again, or check: portbridge logs")
 
 
 class MalformedConfigError(PortBridgeError):
@@ -117,16 +102,4 @@ class MalformedConfigError(PortBridgeError):
         super().__init__(
             f"Config file at {path} is malformed: {detail}",
             f"Fix the syntax, or delete the file to regenerate defaults: rm {path}",
-        )
-
-
-class ProviderAPIChangedError(PortBridgeError):
-    def __init__(self, detail: str = ""):
-        msg = "Could not parse output from the 'tailscale' CLI."
-        if detail:
-            msg += f" ({detail})"
-        super().__init__(
-            msg,
-            "The installed Tailscale version may be newer/older than this "
-            "tool expects. Check: tailscale version",
         )
