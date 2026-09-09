@@ -112,6 +112,40 @@ portbridge listen --port 9001
 advance if you confirm at the prompt — the health monitor will just report
 the local side as down until your service starts.
 
+## My `nc -l` listener keeps dying on its own
+
+Plain `nc -l -p PORT` (without a keep-listening flag) accepts exactly
+**one** TCP connection and then exits — that's normal `nc` behavior, not a
+PortBridge bug. If you're testing with plain `nc`, any single incoming
+connection ends it, including a completely harmless one.
+
+(Versions before this fix landed had a real bug here: PortBridge's own
+`portbridge status` and its background health-check loop tested "is the
+local port listening?" by opening a real TCP connection and closing it —
+which counted as nc's one connection and silently killed it, over and
+over, every health-check interval. That's fixed: PortBridge now checks
+listening state by reading the kernel's socket table
+(`/proc/net/tcp`/`tcp6`), never by connecting, so passive status/health
+checks can no longer end your listener. Update if you're on an older
+checkout.)
+
+What still **does** open a real connection, by design, because it's an
+explicit on-demand test rather than a passive check: `portbridge test`
+(and menu options 5/6). Running that against a plain `nc -l` will still
+end it, the same as any other real client connecting — that's expected,
+not a bug.
+
+For repeated testing, prefer PortBridge's own disposable listener, which
+loops and accepts connections one after another instead of exiting after
+the first:
+
+```bash
+portbridge listen --port 9001
+```
+
+or use an `nc` variant/flag that keeps listening (e.g. `nc -lk` on
+OpenBSD nc / ncat), if you specifically want to use `nc`.
+
 ## Permission denied running `tailscale funnel`/`tailscale up`
 
 `tailscaled` normally requires root. Either let PortBridge prompt for

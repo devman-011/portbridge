@@ -224,7 +224,7 @@ def do_start(
         local_port = validation.parse_port(local_port)
     mode = mode or cfg["provider"]["mode"]
 
-    if not netcheck.is_port_listening(bind, local_port, timeout=1.0):
+    if not netcheck.is_port_listening(bind, local_port):
         print(f"\nWarning: nothing is currently listening on {bind}:{local_port}.")
         if not (assume_yes or ui.ask_yes_no(
             "Continue anyway and forward it once your service starts?", default=True

@@ -61,7 +61,7 @@ def probe_tailscale() -> Probe:
 def probe_local(bind_address: str, port: int | None) -> bool | None:
     if not port:
         return None
-    return netcheck.is_port_listening(bind_address, port, timeout=1.0)
+    return netcheck.is_port_listening(bind_address, port)
 
 
 def probe_funnel_mapped(external_port: int | None) -> bool | None:

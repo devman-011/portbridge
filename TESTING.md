@@ -32,6 +32,16 @@ nc <PUBLIC_ENDPOINT_HOST> <PUBLIC_ENDPOINT_PORT>
 terminal 1. Data typed in either direction that reaches the other side
 confirms the tunnel is forwarding raw bytes correctly.
 
+**If you use plain `nc -l -p 9001` instead of `portbridge listen`:** use a
+`nc` variant/flag that keeps listening after a connection ends (e.g.
+`nc -lk`), or just re-run it each time it exits. Plain `nc -l` without a
+keep-listening flag accepts exactly **one** connection and then quits —
+and PortBridge's own status/health checks are enough to trigger that quit
+even with nobody else connecting (see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#my-nc--l-listener-keeps-dying-on-its-own)),
+which is why `portbridge listen` (loops forever, handles connections one
+after another) is the recommended stand-in here.
+
 ## 2. Forwarding stopped
 
 ```bash
