@@ -137,7 +137,13 @@ def remove_funnel(
     )
     if result.returncode != 0:
         stderr = (result.stderr or "").lower()
-        if "not found" in stderr or "no such" in stderr or "not configured" in stderr or "not running" in stderr:
+        # "does not exist" is real observed text from `tailscale funnel ...
+        # off` when there's nothing to remove ("failed to remove TCP serve:
+        # serve config does not exist") -- undocumented, found in the field.
+        if (
+            "not found" in stderr or "no such" in stderr or "not configured" in stderr
+            or "not running" in stderr or "does not exist" in stderr or "no rule" in stderr
+        ):
             return  # Already off -- treat as success, matches idempotent "stop".
         raise _classify_funnel_error(result.stderr, external_port)
 

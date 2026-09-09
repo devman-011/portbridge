@@ -337,12 +337,14 @@ def do_stop(quiet: bool = False) -> int:
         if not ok and not quiet:
             print("Warning: monitor process did not exit cleanly; forcing cleanup anyway.")
 
+    removal_confirmed = True
     try:
         core.remove_funnel(
             state["bind_address"], state["local_port"], state["external_port"],
             state["mode"], allow_sudo=True,
         )
     except PortBridgeError as exc:
+        removal_confirmed = False
         if not quiet:
             print(f"Warning: {exc.message}")
 
@@ -350,10 +352,17 @@ def do_stop(quiet: bool = False) -> int:
     state_mod.clear_state()
 
     if not quiet:
-        if core.probe_funnel_mapped(external_port):
+        # Tailscale's own remove/off command is authoritative: if it
+        # confirmed removal (or that there was nothing to remove), trust
+        # that instead of also running the heuristic `funnel status`
+        # text/JSON check below -- its schema isn't documented by Tailscale
+        # and can disagree with the real state, which would otherwise print
+        # a confusing, self-contradicting second warning right after the
+        # first one already said the mapping was gone.
+        if not removal_confirmed and core.probe_funnel_mapped(external_port):
             print(
-                "Warning: Tailscale still reports a mapping on that port. "
-                "Check with: tailscale funnel status"
+                "Warning: Tailscale may still report a mapping on that port "
+                "(best-effort check). Verify with: tailscale funnel status"
             )
         print("Forwarding stopped.")
     return 0
