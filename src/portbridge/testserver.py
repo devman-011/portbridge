@@ -32,14 +32,21 @@ def run_echo_listener(bind_address: str, port: int) -> None:
             while True:
                 conn, addr = server.accept()
                 print(f"Connection from {addr[0]}:{addr[1]}")
-                with conn:
-                    while True:
-                        data = conn.recv(4096)
-                        if not data:
-                            print(f"Connection from {addr[0]}:{addr[1]} closed.")
-                            break
-                        sys.stdout.write(data.decode("utf-8", "replace"))
-                        sys.stdout.flush()
-                        conn.sendall(data)
+                try:
+                    with conn:
+                        while True:
+                            data = conn.recv(4096)
+                            if not data:
+                                print(f"Connection from {addr[0]}:{addr[1]} closed.")
+                                break
+                            sys.stdout.write(data.decode("utf-8", "replace"))
+                            sys.stdout.flush()
+                            conn.sendall(data)
+                except OSError as exc:
+                    # A single client resetting/aborting the connection
+                    # (ConnectionResetError, BrokenPipeError, etc.) should
+                    # not take down the whole listener -- go back to
+                    # accepting the next connection instead.
+                    print(f"Connection from {addr[0]}:{addr[1]} dropped: {exc}")
         except KeyboardInterrupt:
             print("\nStopped.")
