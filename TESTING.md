@@ -22,15 +22,23 @@ portbridge endpoint
 ```
 
 ```bash
-# Machine B (ordinary client, no Tailscale installed)
-nc <PUBLIC_ENDPOINT_HOST> <PUBLIC_ENDPOINT_PORT>
-# type something and press Enter
+# Machine B (ordinary client, no Tailscale installed).
+# Must be TLS-capable -- Tailscale requires TLS at its edge even in the
+# default tls-terminated-tcp mode (it terminates it for you, but the
+# connecting client still has to complete the handshake). A bare `nc`
+# will connect at the TCP level and then get nothing through. Use one of:
+openssl s_client -connect <PUBLIC_ENDPOINT_HOST>:<PUBLIC_ENDPOINT_PORT> -quiet
+# or:
+ncat --ssl <PUBLIC_ENDPOINT_HOST> <PUBLIC_ENDPOINT_PORT>
+# then type something and press Enter
 ```
 
 **Expected:** whatever you type on Machine B is echoed back (PortBridge's
 `listen` test server echoes input), and it appears verbatim in Machine A
 terminal 1. Data typed in either direction that reaches the other side
-confirms the tunnel is forwarding raw bytes correctly.
+confirms the tunnel is forwarding bytes correctly. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#connected-but-nothing-comes-through-client-must-speak-tls)
+if a plain `nc` "connects" but nothing ever arrives.
 
 **If you use plain `nc -l -p 9001` instead of `portbridge listen`:** use a
 `nc` variant/flag that keeps listening after a connection ends (e.g.
@@ -52,7 +60,7 @@ portbridge status   # Forwarding: STOPPED
 
 ```bash
 # Machine B
-nc <PUBLIC_ENDPOINT_HOST> <PUBLIC_ENDPOINT_PORT>
+openssl s_client -connect <PUBLIC_ENDPOINT_HOST>:<PUBLIC_ENDPOINT_PORT> -quiet
 ```
 
 **Expected:** Machine B's connection fails/refuses immediately — the public

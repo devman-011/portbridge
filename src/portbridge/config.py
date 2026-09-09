@@ -39,7 +39,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "provider": {
         "name": "tailscale-funnel",
-        "mode": "tcp",
+        # Tailscale's own docs state plainly that "Funnel only works over
+        # TLS-encrypted connections" -- this applies to --tcp too, not just
+        # HTTPS mode. --tcp ("raw") only means Tailscale passes the TLS
+        # bytes through undecrypted; the connecting client still MUST
+        # speak TLS to get past Tailscale's edge at all, so a genuinely
+        # plain client (nc, a game client, ...) gets nothing through it.
+        # tls-terminated-tcp is the mode that actually works with an
+        # ordinary, non-TLS local service: Tailscale terminates the
+        # mandatory TLS at its edge and hands your local service plain
+        # bytes -- only the *remote* client needs a TLS-capable tool
+        # (e.g. `ncat --ssl`, `openssl s_client`), your local side is
+        # unaffected. See https://github.com/tailscale/tailscale/issues/14240
+        # for another user hitting this with a plain TCP (Minecraft) client.
+        "mode": "tls-terminated-tcp",
     },
     "behavior": {
         "auto_start": False,

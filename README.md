@@ -2,11 +2,16 @@
 
 PortBridge is a Linux CLI tool that exposes a TCP service running on your
 machine to the public internet, so that **ordinary remote machines can
-connect to it without installing any VPN client or special software**.
+connect to it without installing any VPN client**.
 
 Only your Linux machine joins a tunneling network (Tailscale). The remote
-side is a plain TCP client — `nc`, a browser, a game client, an SSH client,
-whatever your service expects.
+side never installs Tailscale or any VPN client — but it does need a
+TLS-capable connection, since that's a hard requirement of Tailscale
+Funnel itself (see below), not a PortBridge choice. In practice that means
+a browser, `openssl s_client`, `ncat --ssl`, or a plain client wrapped
+through one of those — see
+[Connecting non-TLS clients](#connecting-non-tls-clients-ssh-games-custom-protocols)
+below for exactly how.
 
 PortBridge forwards raw TCP bytes only. It does not interpret, modify, or
 execute anything sent over the connection, and it does not run a remote
@@ -20,12 +25,13 @@ LOCAL TCP SERVICE  (e.g. `nc -l -p 9001`, a game server, an SSH daemon...)
         |
         v
  TAILSCALE FUNNEL         <- your machine's tunnel into Tailscale's network
+                              (terminates the TLS it always requires here)
         |
         v
  PUBLIC TCP ENDPOINT       <yourmachine>.ts.net:{443,8443,10000}
         |
         v
- ORDINARY REMOTE TCP CLIENT   (no VPN, no Tailscale, no special software)
+ REMOTE TCP CLIENT   (no VPN/Tailscale install -- but must speak TLS to connect)
 ```
 
 ## Why Tailscale Funnel
@@ -189,14 +195,27 @@ side.
 
 ## How the forwarding actually works
 
-- `portbridge start` runs `tailscale funnel --bg --tcp=<external-port>
-  tcp://<bind>:<local-port>` (or `--tls-terminated-tcp=` if you configure
-  `mode = "tls-terminated-tcp"`). `--tcp` is a raw TCP forwarder — this is
-  the default and what you want for a plain `nc`-style test, since it does
-  not require the connecting client to perform a TLS handshake.
-  `--tls-terminated-tcp` has Tailscale terminate TLS at its edge and hand
-  your local service plaintext; use it only if your remote clients are
-  expected to speak TLS to the public endpoint.
+- `portbridge start` runs `tailscale funnel --bg --tls-terminated-tcp=
+  <external-port> tcp://<bind>:<local-port>` by default. Tailscale states
+  plainly that *"Funnel only works over TLS-encrypted connections"* — this
+  applies even to the `--tcp` ("raw") mode; it isn't scoped to HTTPS only.
+  The difference between the two modes is only *who* terminates that
+  mandatory TLS layer:
+  - **`tls-terminated-tcp` (the default)** — Tailscale terminates TLS at
+    its edge and hands your local service plain, unencrypted bytes. Your
+    local service (a plain `nc`, `portbridge listen`, a game server, ...)
+    needs no changes. Only the *remote* connecting client needs a
+    TLS-capable tool, e.g. `openssl s_client -connect host:port` or
+    `ncat --ssl host port` — a bare `nc host port` will connect at the TCP
+    level and then get nothing through, since it never completes the
+    required TLS handshake.
+  - **`tcp` ("raw")** — Tailscale still requires TLS at its edge, but
+    passes the still-encrypted bytes through *without* decrypting them, so
+    your local service itself must terminate TLS. Only use this if your
+    local service already speaks TLS directly (its own cert, etc).
+    Confirmed by another user hitting exactly this with a plain
+    (non-TLS) Minecraft client:
+    [tailscale/tailscale#14240](https://github.com/tailscale/tailscale/issues/14240).
 - Tailscale's own infrastructure (not PortBridge) handles NAT traversal,
   routing, and the public `*.ts.net` hostname/certificate. No inbound
   firewall or router port-forwarding changes are needed on your machine —
@@ -206,6 +225,38 @@ side.
 - PortBridge's own background monitor does **not** forward bytes itself; it
   only applies/removes the Funnel mapping and watches its health. The
   actual byte forwarding is done entirely by `tailscaled`.
+
+## Connecting non-TLS clients (SSH, games, custom protocols)
+
+Because Tailscale requires a real TLS handshake as the very first thing on
+the wire, a client that doesn't speak TLS at all — a stock `ssh` client,
+most game clients, most bespoke TCP protocols — can't connect to the
+public endpoint directly, even with `tls-terminated-tcp` mode doing you
+the favor of decrypting for your local service. You need to wrap the
+connection in TLS yourself on the client side. Two common patterns:
+
+**SSH**, using `openssl` as the TLS layer via `ProxyCommand` (the remote
+user runs this, no Tailscale/VPN install involved, just a locally-run
+`openssl`):
+
+```bash
+ssh -o ProxyCommand="openssl s_client -quiet -connect %h:%p" user@yourmachine.your-tailnet.ts.net -p 10000
+```
+
+**Anything else (games, custom protocols)** that only knows how to speak
+to a plain `host:port` — run a local TLS-terminating proxy on the
+*client's* machine and point the actual client at that local proxy
+instead of the public endpoint directly. `socat` is a common choice:
+
+```bash
+# On the remote/client machine:
+socat TCP-LISTEN:9001,fork OPENSSL:yourmachine.your-tailnet.ts.net:10000,verify=0
+# Then point the actual client (game, etc.) at 127.0.0.1:9001
+```
+
+(`verify=0` skips certificate hostname validation against Tailscale's
+`*.ts.net` cert chain for convenience; drop it and configure proper CA
+trust if that matters for your use case.)
 
 ## Security considerations
 
@@ -227,6 +278,11 @@ side.
 
 - External TCP port is restricted to 443, 8443, or 10000 (see above) — this
   is a Tailscale Funnel restriction, not a PortBridge one.
+- **Every connecting client must speak TLS to reach the public endpoint at
+  all** — Tailscale enforces this at its edge regardless of mode. A
+  genuinely plain TCP client (bare `nc`, stock `ssh`, most game/custom
+  protocol clients) cannot connect directly; see
+  [Connecting non-TLS clients](#connecting-non-tls-clients-ssh-games-custom-protocols).
 - The public hostname is always `<device>.<tailnet>.ts.net`; Funnel cannot
   use a custom domain.
 - Funnel traffic is subject to Tailscale's non-configurable bandwidth

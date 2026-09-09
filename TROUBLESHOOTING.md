@@ -6,6 +6,42 @@ traceback, that's an unexpected error — it's also written in full to
 `~/.local/state/portbridge/portbridge.log`; please include that when
 reporting a bug.
 
+## Connected, but nothing comes through (client must speak TLS)
+
+Symptom: a remote client "connects" to the public endpoint (no timeout,
+no refused connection), you send data, but it never shows up at your
+local service — and the client's connection often just ends right after.
+
+This is a Tailscale Funnel characteristic, not a PortBridge bug. Quoting
+Tailscale's own docs: *"Funnel only works over TLS-encrypted
+connections"* — and that applies even to the `--tcp` ("raw") mode, not
+just HTTPS. A plain, non-TLS client (bare `nc`, most simple TCP/game
+clients) never completes a TLS handshake, so Tailscale's edge rejects it
+before any bytes ever reach your machine. Another user hit this exact
+issue with a plain Minecraft client:
+[tailscale/tailscale#14240](https://github.com/tailscale/tailscale/issues/14240).
+
+**Fix:** use PortBridge's default mode, `tls-terminated-tcp`, and connect
+with a TLS-capable client:
+
+```bash
+portbridge configure --mode tls-terminated-tcp   # already the default since 1.0.2
+openssl s_client -connect <host>:<port> -quiet
+# or
+ncat --ssl <host> <port>
+```
+
+In `tls-terminated-tcp` mode, Tailscale terminates that mandatory TLS for
+you at its edge and hands your local service (plain `nc`,
+`portbridge listen`, whatever) ordinary unencrypted bytes — your local
+side needs no changes at all. Only the *remote* connecting client needs
+the TLS-capable tool.
+
+If you specifically need your local service to receive the raw,
+still-encrypted TLS bytes itself (rare — only if your local service
+already terminates TLS on its own), that's what `--mode tcp` is for
+instead, but a plain client still can't be used to test it.
+
 ## "tailscale is not installed (or not on PATH)"
 
 Quickest fix: `portbridge setup` detects this and offers to install it for

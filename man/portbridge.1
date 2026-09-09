@@ -62,10 +62,12 @@ Requested public port (must be 443, 8443, or 10000).
 Local bind address (default 127.0.0.1).
 .TP
 .BR \-\-mode =\fIMODE\fR
-.I tcp
-(raw TCP forwarder, default) or
 .I tls\-terminated\-tcp
-(Tailscale terminates TLS at the edge).
+(default; Tailscale terminates the TLS it always requires at its edge and
+hands your local service plain bytes) or
+.I tcp
+(raw forwarder; Tailscale still requires TLS at the edge but does not
+decrypt it, so your local service must terminate TLS itself).
 .TP
 .B \-\-foreground
 Run in the foreground instead of detaching a background monitor. Intended

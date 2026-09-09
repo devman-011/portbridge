@@ -170,7 +170,26 @@ def _cleanup(logger) -> None:
                 state["mode"], allow_sudo=False,
             )
             logger.info("Funnel mapping removed on shutdown.")
+            state_mod.clear_state()
         except PortBridgeError as exc:
-            logger.warning("Could not cleanly remove funnel mapping on shutdown: %s", exc.message)
-        state_mod.clear_state()
+            # allow_sudo=False here on purpose (no TTY to prompt on) means
+            # this commonly fails with a plain permission error when the
+            # user hasn't been made a Tailscale operator. Don't clear state
+            # to STOPPED in that case -- that would make PortBridge believe
+            # forwarding is off while the real Funnel mapping is still
+            # live, and a later `portbridge stop` would short-circuit on
+            # "not currently active" without ever attempting the
+            # sudo-elevated removal that could actually finish the job.
+            # Marking FAILED (not STOPPED) while keeping bind/port/mode
+            # lets a later `portbridge stop`/`start` find and finish this.
+            logger.warning(
+                "Could not remove funnel mapping on shutdown (%s). Leaving "
+                "state as FAILED (not STOPPED) so a later 'portbridge "
+                "stop' can retry with sudo instead of silently believing "
+                "forwarding is already off.", exc.message,
+            )
+            state["pid"] = None
+            state["status"] = state_mod.FAILED
+            state["last_error"] = f"Cleanup on shutdown could not remove the Funnel mapping: {exc.message}"
+            state_mod.save_state(state)
     logger.info("Monitor stopped (pid=%s).", os.getpid())

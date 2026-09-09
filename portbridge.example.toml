@@ -26,13 +26,22 @@ external_port = 10000
 [provider]
 name = "tailscale-funnel"
 
+# Tailscale requires TLS at its edge either way ("Funnel only works over
+# TLS-encrypted connections", per Tailscale's own docs) -- these two modes
+# only differ in who terminates it:
+#
+# "tls-terminated-tcp" (default) -- tailscale funnel --tls-terminated-tcp=<port> ...
+#                        Tailscale terminates TLS at the edge and hands
+#                        your local service plain bytes. Your local
+#                        service (a plain `nc`/`nc -l`, etc.) needs no
+#                        changes; the *remote* client needs a TLS-capable
+#                        tool (`openssl s_client`, `ncat --ssl`) -- a bare
+#                        `nc` will connect but get no data through.
 # "tcp"              -- tailscale funnel --tcp=<port> ...
-#                        raw TCP forwarder; matches a plain `nc`/`nc -l` test.
-# "tls-terminated-tcp" -- tailscale funnel --tls-terminated-tcp=<port> ...
-#                        Tailscale terminates TLS at the edge before
-#                        forwarding plaintext to your local service; the
-#                        remote client must speak TLS to connect.
-mode = "tcp"
+#                        Tailscale passes the still-TLS-encrypted bytes
+#                        through undecrypted; only useful if your LOCAL
+#                        service itself terminates TLS.
+mode = "tls-terminated-tcp"
 
 [behavior]
 # Informational only -- PortBridge never enables/starts systemd on its own.

@@ -505,6 +505,14 @@ def do_test(check_local: bool = True, check_external: bool = True, port: int | N
             else:
                 ok, msg = netcheck.tcp_connect_test(host, state["external_port"], timeout=timeout)
                 print(("✓ " if ok else "✗ ") + msg)
+                if ok:
+                    print(
+                        "  (This confirms the public port accepts a TCP connection only. "
+                        "Tailscale Funnel requires TLS at its edge even in this mode -- a "
+                        "plain, non-TLS client will connect but get no data through. Use "
+                        "'openssl s_client -connect host:port' or 'ncat --ssl' to test data "
+                        "flow end-to-end.)"
+                    )
                 ok_all = ok_all and ok
 
     return 0 if ok_all else 1
