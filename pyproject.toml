@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portbridge"
-version = "1.0.0"
+version = "1.0.1"
 description = "TCP port forwarding manager built on Tailscale Funnel"
 readme = "README.md"
 requires-python = ">=3.8"
