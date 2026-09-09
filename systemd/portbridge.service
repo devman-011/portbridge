@@ -1,0 +1,26 @@
+[Unit]
+Description=PortBridge TCP forwarding (Tailscale Funnel)
+Documentation=https://tailscale.com/kb/1223/funnel
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=simple
+User=__PORTBRIDGE_USER__
+ExecStart=__PORTBRIDGE_EXEC__ start --foreground
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+# PortBridge itself never needs elevated privileges beyond what running
+# `tailscale funnel`/`tailscale up` requires. If this user is not root and
+# has not been made a Tailscale operator (sudo tailscale set
+# --operator=<user>), reconnect attempts made by this service will fail
+# with a permission error rather than hang, since the background monitor
+# never attempts an interactive sudo prompt.
+
+[Install]
+WantedBy=multi-user.target

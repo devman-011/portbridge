@@ -1,0 +1,5 @@
+# PortBridge's only runtime dependency: a TOML reader on Python < 3.11
+# (tomllib is stdlib from 3.11 onward). No other third-party packages are
+# required -- the CLI/menu, TOML writer, and networking code all use only
+# the standard library.
+tomli>=2.0.1; python_version < "3.11"

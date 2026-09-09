@@ -1,0 +1,65 @@
+# Example PortBridge configuration.
+#
+# Installed default location: ~/.config/portbridge/config.toml
+# (PortBridge creates this automatically on first run with built-in
+# defaults; this file is a documented reference, not required reading.)
+#
+# No secrets belong in this file. Tailscale authentication is handled
+# entirely by `tailscale up` / `tailscale login`, which store their own
+# credentials inside tailscaled's state directory -- PortBridge never
+# reads, stores, or logs an auth key.
+
+[network]
+# Local address PortBridge forwards FROM. Keep this at 127.0.0.1 unless you
+# specifically need to forward a service bound to a different local
+# interface -- PortBridge will not bind other interfaces automatically.
+bind_address = "127.0.0.1"
+
+# Default local port used when you run `portbridge start` with no --port
+# and answer the interactive prompt with Enter. 0 means "always ask".
+local_port = 0
+
+# Default external (public) port. Tailscale Funnel only supports 443,
+# 8443, or 10000 -- see https://tailscale.com/kb/1223/funnel
+external_port = 10000
+
+[provider]
+name = "tailscale-funnel"
+
+# "tcp"              -- tailscale funnel --tcp=<port> ...
+#                        raw TCP forwarder; matches a plain `nc`/`nc -l` test.
+# "tls-terminated-tcp" -- tailscale funnel --tls-terminated-tcp=<port> ...
+#                        Tailscale terminates TLS at the edge before
+#                        forwarding plaintext to your local service; the
+#                        remote client must speak TLS to connect.
+mode = "tcp"
+
+[behavior]
+# Informational only -- PortBridge never enables/starts systemd on its own.
+# Set this to true as a personal reminder that you've set up the systemd
+# unit for auto-start on boot; it has no other effect.
+auto_start = false
+
+# Whether the background monitor retries automatically after a tunnel
+# health-check failure.
+reconnect = true
+
+# 0 = retry indefinitely. Any positive number = give up after that many
+# consecutive failed attempts and mark forwarding FAILED.
+reconnect_max_attempts = 0
+
+# Exponential backoff: delay = min(reconnect_backoff_max_seconds,
+# reconnect_backoff_base_seconds * 2^(attempt-1))
+reconnect_backoff_base_seconds = 2
+reconnect_backoff_max_seconds = 60
+
+# How often the background monitor checks tunnel + local-port health.
+health_check_interval_seconds = 15
+
+# Timeout used for `portbridge test` and internal connectivity checks.
+connect_timeout_seconds = 5
+
+[logging]
+level = "INFO"          # DEBUG | INFO | WARNING | ERROR
+max_bytes = 5242880      # Rotate the log file after ~5 MB
+backup_count = 3         # Keep this many rotated log files

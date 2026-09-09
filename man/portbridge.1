@@ -1,0 +1,172 @@
+.TH PORTBRIDGE 1 "2026" "portbridge 1.0.0" "PortBridge Manual"
+.SH NAME
+portbridge \- manage TCP port forwarding to the public internet via Tailscale Funnel
+.SH SYNOPSIS
+.B portbridge
+.RI [ command ]
+.RI [ options ]
+.SH DESCRIPTION
+.B portbridge
+exposes a TCP service listening on this Linux machine to ordinary internet
+TCP clients, without requiring the remote machine to install any VPN
+client or special software. It does this by driving the official
+.B tailscale
+CLI's Funnel feature: this machine joins your private Tailscale network
+(tailnet) and Tailscale's infrastructure publishes one of your local ports
+to a fixed, small set of public TCP ports on your tailnet's
+.I *.ts.net
+hostname. Only this machine ever needs Tailscale installed; a remote user
+connects with a plain TCP client such as
+.BR nc (1).
+.PP
+portbridge never inspects, modifies, or executes anything received over
+the forwarded connection \(em it forwards raw TCP bytes only.
+.PP
+Because Tailscale Funnel is restricted by the provider to external TCP
+ports 443, 8443, and 10000, portbridge will refuse to silently substitute
+a different port when you request one that isn't supported; instead it
+explains the restriction and asks you to choose an allowed port.
+.PP
+With no command, portbridge launches an interactive menu.
+.SH COMMANDS
+.TP
+.B setup
+Check whether Tailscale is installed, its background service is running,
+and this device is authenticated -- offering to fix each gap
+interactively (installing Tailscale, starting
+.BR tailscaled ,
+running
+.BR "tailscale up" )
+with a confirmation prompt before each action. Never proceeds on its own
+in a non-interactive context unless
+.B \-\-yes
+is given.
+.RS
+.TP
+.BR \-y ", " \-\-yes
+Assume yes on all confirmation prompts.
+.RE
+.TP
+.B start
+Start TCP port forwarding. Prompts interactively for anything not given on
+the command line.
+.RS
+.TP
+.BR \-\-port =\fIPORT\fR
+Local port to forward.
+.TP
+.BR \-\-external\-port =\fIPORT\fR
+Requested public port (must be 443, 8443, or 10000).
+.TP
+.BR \-\-bind =\fIADDRESS\fR
+Local bind address (default 127.0.0.1).
+.TP
+.BR \-\-mode =\fIMODE\fR
+.I tcp
+(raw TCP forwarder, default) or
+.I tls\-terminated\-tcp
+(Tailscale terminates TLS at the edge).
+.TP
+.B \-\-foreground
+Run in the foreground instead of detaching a background monitor. Intended
+for use as a systemd
+.B ExecStart
+command.
+.TP
+.BR \-y ", " \-\-yes
+Assume yes on all confirmation prompts (for scripting).
+.RE
+.TP
+.B stop
+Stop TCP port forwarding started by portbridge. Never affects the local
+service listening on the forwarded port, and never affects processes
+portbridge did not start.
+.TP
+.B status
+Print a detailed status report: Tailscale install/auth/connection state,
+whether the local port is listening, current forwarding status, the
+public endpoint, uptime, and a health checklist.
+.TP
+.B endpoint
+Print the current public endpoint as
+.IR host:port .
+.TP
+.B test
+Test connectivity.
+.RS
+.TP
+.B \-\-local
+Test only the local port.
+.TP
+.B \-\-external
+Test only the external (public) endpoint.
+.TP
+.BR \-\-port =\fIPORT\fR
+Override which local port to test.
+.RE
+.TP
+.B logs
+Show recent log entries from
+.IR ~/.local/state/portbridge/portbridge.log .
+.RS
+.TP
+.BR \-f ", " \-\-follow
+Follow the log live (like
+.BR "tail \-f" ).
+.TP
+.BR \-n =\fIN\fR
+Number of lines to show (default 50).
+.RE
+.TP
+.B restart
+Stop (if running) and start again using the previously stored
+configuration.
+.TP
+.B configure
+Interactive configuration wizard, or pass flags (see
+.BR "portbridge configure \-\-help" )
+to set specific values non\-interactively.
+.TP
+.B listen
+Run a disposable TCP echo listener for testing, completely separate from
+forwarding management. Equivalent in spirit to
+.BR "nc \-l \-p PORT" .
+Requires
+.BR \-\-port .
+.TP
+.B \-\-version
+Print the installed version and exit.
+.SH FILES
+.TP
+.I ~/.config/portbridge/config.toml
+User configuration (bind address, default ports, health\-check/backoff
+timings, logging level). Contains no secrets.
+.TP
+.I ~/.local/state/portbridge/state.json
+Current runtime state: whether forwarding is active, the monitor PID,
+configured ports, public hostname, start time, and health.
+.TP
+.I ~/.local/state/portbridge/portbridge.log
+Rotating log file.
+.SH EXIT STATUS
+.B 0
+on success,
+.B 1
+on a handled error (message printed to stderr),
+.B 130
+if interrupted with Ctrl+C.
+.SH SECURITY
+portbridge never stores Tailscale authentication tokens; login is
+delegated entirely to
+.B tailscale up
+/
+.BR "tailscale login" .
+It never scans the network, never opens ports you did not request, never
+modifies local firewall rules, and never executes anything received over
+the forwarded TCP connection.
+.SH SEE ALSO
+.BR tailscale (1),
+.BR nc (1),
+.BR systemctl (1)
+.br
+Tailscale Funnel documentation: https://tailscale.com/kb/1223/funnel
