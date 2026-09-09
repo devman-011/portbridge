@@ -375,8 +375,6 @@ def do_restart(assume_yes: bool = False) -> int:
 
     local_port = state.get("local_port")
     external_port = state.get("external_port")
-    bind = state.get("bind_address")
-    mode = state.get("mode")
 
     if was_active:
         do_stop(quiet=True)
@@ -386,11 +384,17 @@ def do_restart(assume_yes: bool = False) -> int:
         cfg = config_mod.load_config()
         local_port = cfg["network"]["local_port"] or None
         external_port = cfg["network"]["external_port"]
-        bind = cfg["network"]["bind_address"]
-        mode = cfg["provider"]["mode"]
 
+    # bind/mode are deliberately NOT carried over from the old state here:
+    # do_start() falls back to the CURRENT config.toml for those when not
+    # passed explicitly. If we instead resurrected them from state (what
+    # was actually running before), a `portbridge configure --mode ...`/
+    # `--bind ...` change would get silently overwritten back to the old
+    # value on the very next restart -- do_start() re-saves whatever mode
+    # it used back into config.toml, so this previously clobbered a config
+    # change with no indication anything had reverted.
     return do_start(
-        local_port=local_port, external_port=external_port, bind=bind, mode=mode,
+        local_port=local_port, external_port=external_port,
         assume_yes=assume_yes,
     )
 
